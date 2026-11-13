@@ -25,7 +25,7 @@ pub fn layers_at(p: &Project, t: Time) -> Vec<Layer> {
         let Some(c) = track.clips.get(i).filter(|c| c.contains(t)) else { continue };
         let local = t - c.start;
         let pr = &c.params;
-        let opacity = pr.opacity.eval(local).clamp(0.0, 1.0);
+        let opacity = pr.opacity.eval(local).clamp(0.0, 1.0) * c.fade_gain(local);
         if opacity <= 0.0 {
             continue;
         }

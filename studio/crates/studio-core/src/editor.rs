@@ -24,6 +24,9 @@ pub struct HistoryEntry {
     /// 元に戻すコマンド(この順に実行)
     pub inverse: Vec<Command>,
     pub summary: Vec<String>,
+    /// 連続した変更をまとめるための目印(例: "text:12")と、最後に変更した時刻
+    #[serde(skip)]
+    pub merge: Option<(String, std::time::Instant)>,
 }
 
 /// 実行結果。
@@ -106,13 +109,39 @@ impl Editor {
         }
         let (forward, inverse, out) = run(&mut self.project, &cmds)?;
         if !forward.is_empty() {
-            self.undo.push(HistoryEntry { label: label.to_string(), origin, forward, inverse, summary: out.summary.clone() });
+            self.undo.push(HistoryEntry { label: label.to_string(), origin, forward, inverse, summary: out.summary.clone(), merge: None });
             if self.undo.len() > self.max_history {
                 self.undo.remove(0);
             }
             self.redo.clear();
             self.dirty = true;
         }
+        Ok(out)
+    }
+
+    /// 連続した変更(文字の入力、色の調整など)を、1 回の Undo で戻せる 1 つの操作にまとめて実行する。
+    /// 直前の操作が同じ `key` で、`window` 以内に行われていれば、その操作に合流させる。
+    pub fn transaction_merged(&mut self, label: &str, cmds: Vec<Command>, origin: Origin, key: &str, window: std::time::Duration) -> Result<Outcome, TransactionError> {
+        let now = std::time::Instant::now();
+        let can_merge = self.redo.is_empty()
+            && self.undo.last().is_some_and(|e| e.origin == origin && e.merge.as_ref().is_some_and(|(k, t)| k == key && now.duration_since(*t) <= window));
+        if !can_merge {
+            let out = self.transaction(label, cmds, origin)?;
+            if let Some(e) = self.undo.last_mut() {
+                e.merge = Some((key.to_string(), now));
+            }
+            return Ok(out);
+        }
+        let (forward, inverse, out) = run(&mut self.project, &cmds)?;
+        let e = self.undo.last_mut().unwrap();
+        e.forward.extend(forward);
+        // 新しい変更を先に戻し、その後で以前の変更を戻す
+        let mut inv = inverse;
+        inv.extend(std::mem::take(&mut e.inverse));
+        e.inverse = inv;
+        e.summary = out.summary.clone();
+        e.merge = Some((key.to_string(), now));
+        self.dirty = true;
         Ok(out)
     }
 

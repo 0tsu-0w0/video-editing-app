@@ -5,6 +5,7 @@
 //! - `export`: プロジェクト全体を MP4 に書き出す
 
 pub mod gpu;
+pub mod text;
 
 use gpu::{Gpu, Placement, Texture};
 use std::collections::HashMap;
@@ -18,6 +19,8 @@ use studio_media::{AudioReader, ExportSettings, Exporter, VideoReader};
 enum Source {
     Video { reader: VideoReader, tex: Option<Texture>, shown: Option<Time> },
     Image { tex: Texture },
+    /// 文字。内容が変わったら作り直す
+    Text { tex: Texture, made_from: AssetKind },
     Broken(String),
 }
 
@@ -35,6 +38,12 @@ impl Renderer {
     }
 
     fn source(&mut self, project: &Project, asset: Id) -> &mut Source {
+        // 文字の内容が変わっていたら作り直す
+        if let (Some(Source::Text { made_from, .. }), Some(a)) = (self.sources.get(&asset), project.assets.get(&asset)) {
+            if *made_from != a.kind {
+                self.sources.remove(&asset);
+            }
+        }
         if !self.sources.contains_key(&asset) {
             let s = match project.assets.get(&asset) {
                 None => Source::Broken(format!("素材 {asset} がありません")),
@@ -53,6 +62,10 @@ impl Renderer {
                             Err(e) => Source::Broken(format!("「{}」: {e}", a.name)),
                         },
                         AssetKind::Audio { .. } => Source::Broken("音声のみの素材".into()),
+                        AssetKind::Text { text, style } => match text::rasterize(text, style).and_then(|(w, h, px)| self.gpu.create_texture(w, h, Some(&px), false)) {
+                            Ok(tex) => Source::Text { tex, made_from: a.kind.clone() },
+                            Err(e) => Source::Broken(format!("「{}」: {e}", a.name)),
+                        },
                     }
                 }
             };
@@ -101,7 +114,7 @@ impl Renderer {
                     *shown = Some(f.time);
                     tex.as_ref().unwrap()
                 }
-                Source::Image { tex } => tex,
+                Source::Image { tex } | Source::Text { tex, .. } => tex,
                 Source::Broken(_) => continue,
             };
             gpu.draw(
@@ -164,7 +177,7 @@ impl Mixer {
             let step = 64;
             let gains = |i: usize| {
                 let t = sample_to_time(s0 + i as i64, self.rate) - span.clip_start;
-                let v = clip.params.volume.eval(t).max(0.0) as f32;
+                let v = (clip.params.volume.eval(t).max(0.0) * clip.fade_gain(t)) as f32;
                 let p = clip.params.pan.eval(t).clamp(-1.0, 1.0) as f32;
                 // 等パワーのパン
                 let a = (p + 1.0) * std::f32::consts::FRAC_PI_4;

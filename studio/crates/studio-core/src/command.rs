@@ -73,7 +73,7 @@ pub enum Command {
     ImportAsset {
         name: String,
         path: String,
-        #[serde(flatten)]
+        /// 素材の種類と情報(例: {"type": "text", "text": "...", "style": {...}})
         kind: AssetKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<Id>,
@@ -120,6 +120,33 @@ pub enum Command {
         at: Time,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_id: Option<Id>,
+    },
+
+    /// フェードイン・アウトの長さ(省略した方はそのまま。0 で無し)
+    SetFade {
+        clip: Id,
+        #[serde(default, with = "opt_secs", skip_serializing_if = "Option::is_none")]
+        fade_in: Option<Time>,
+        #[serde(default, with = "opt_secs", skip_serializing_if = "Option::is_none")]
+        fade_out: Option<Time>,
+    },
+    /// 文字素材の内容や見た目を変える(省略した項目はそのまま)
+    SetText {
+        asset: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outline: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outline_color: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        align: Option<String>,
     },
 
     // ---- 値・キーフレーム
@@ -188,6 +215,8 @@ impl Command {
             Command::MoveClip { .. } => "move_clip",
             Command::TrimClip { .. } => "trim_clip",
             Command::SplitClip { .. } => "split_clip",
+            Command::SetFade { .. } => "set_fade",
+            Command::SetText { .. } => "set_text",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
             Command::RemoveKey { .. } => "remove_key",
@@ -362,8 +391,15 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             done(vec![inv], cmd.clone(), None, format!("トラック {track} の設定を変更"))
         }
         ImportAsset { name, path, kind, id } => {
-            if name.trim().is_empty() || path.trim().is_empty() {
+            let is_text = matches!(kind, AssetKind::Text { .. });
+            if name.trim().is_empty() || (path.trim().is_empty() && !is_text) {
                 return err("invalid", "素材の名前とパスを指定してください");
+            }
+            if let AssetKind::Text { text, style } = &kind {
+                if text.chars().count() > 10_000 {
+                    return err("invalid", "文字が長すぎます(1 万文字まで)");
+                }
+                style.check().or_else(|m| err("invalid", m))?;
             }
             if let Some(d) = kind.duration() {
                 if d <= Time::ZERO {
@@ -400,7 +436,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 (None, None) => Time::from_secs_f64(5.0),
             };
             let id = take_id(p, id)?;
-            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default() };
+            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO };
             check_clip_time(p, &clip)?;
             insert_clip(track_mut(p, track)?, clip)?;
             done(
@@ -467,13 +503,16 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             if let Some(s) = source_in {
                 c.source_in = s;
             }
+            // フェードが長さに収まらなければ縮める
+            c.fade_in = c.fade_in.min(c.duration);
+            c.fade_out = c.fade_out.min(c.duration - c.fade_in);
             let r = check_clip_time(p, &c).and_then(|_| insert_clip(track_mut(p, tid)?, c.clone()));
             if let Err(e) = r {
                 insert_clip(track_mut(p, tid)?, old).expect("元に戻せない");
                 return Err(e);
             }
             done(
-                vec![TrimClip { clip, start: Some(old.start), duration: Some(old.duration), source_in: Some(old.source_in) }],
+                vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old.clone() }],
                 cmd.clone(),
                 None,
                 format!("クリップ {clip} を {}〜{} に変更", c.start, c.end()),
@@ -492,7 +531,10 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             let left = at - c.start;
             t.clips[ci].duration = left;
             // 右側のキーフレームは、新しいクリップの開始基準に付け直す
-            let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: c.source_in + left, ..c.clone() };
+            let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: c.source_in + left, fade_in: Time::ZERO, ..c.clone() };
+            right.fade_out = right.fade_out.min(right.duration);
+            t.clips[ci].fade_out = Time::ZERO;
+            t.clips[ci].fade_in = t.clips[ci].fade_in.min(left);
             for (name, _, _) in PARAMS {
                 let (lp, rp) = (t.clips[ci].params.get_mut(name).unwrap(), right.params.get_mut(name).unwrap());
                 if !lp.keys.is_empty() {
@@ -513,6 +555,52 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 Some(new_id),
                 format!("クリップ {clip} を {at} で分割(右側はクリップ {new_id})"),
             )
+        }
+        SetFade { clip, fade_in, fade_out } => {
+            let (t, ci) = clip_mut(p, clip)?;
+            unlocked(t)?;
+            let tid = t.id;
+            let old = t.clips[ci].clone();
+            let (fi, fo) = (fade_in.unwrap_or(old.fade_in), fade_out.unwrap_or(old.fade_out));
+            if fi < Time::ZERO || fo < Time::ZERO {
+                return err("invalid", "フェードの長さが負です");
+            }
+            if fi + fo > old.duration {
+                return err("out_of_range", format!("フェードイン {fi} + フェードアウト {fo} が、クリップの長さ {} を超えています", old.duration));
+            }
+            t.clips[ci].fade_in = fi;
+            t.clips[ci].fade_out = fo;
+            done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, format!("クリップ {clip} のフェードをイン {fi}・アウト {fo} に設定"))
+        }
+        SetText { asset, text, font, size, color, outline, outline_color, align } => {
+            let a = p.assets.get_mut(&asset).ok_or(EditError { code: "not_found", message: format!("素材 {asset} はありません") })?;
+            let old = a.clone();
+            let AssetKind::Text { text: t, style } = &mut a.kind else {
+                return err("invalid", format!("素材 {asset} は文字ではありません"));
+            };
+            if let Some(v) = text {
+                if v.chars().count() > 10_000 {
+                    return err("invalid", "文字が長すぎます(1 万文字まで)");
+                }
+                *t = v;
+            }
+            let mut st = style.clone();
+            if let Some(v) = font { st.font = v; }
+            if let Some(v) = size { st.size = v; }
+            if let Some(v) = color { st.color = v; }
+            if let Some(v) = outline { st.outline = v; }
+            if let Some(v) = outline_color { st.outline_color = v; }
+            if let Some(v) = align { st.align = v; }
+            if let Err(m) = st.check() {
+                *a = old;
+                return err("invalid", m);
+            }
+            *style = st;
+            if !t.is_empty() && a.name.starts_with("文字") {
+                a.name = format!("文字「{}」", t.chars().take(12).collect::<String>().replace('\n', " "));
+            }
+            let s = format!("文字素材 {asset} を変更");
+            done(vec![RestoreAsset { asset: old }], cmd.clone(), None, s)
         }
         SetParam { clip, param, value } => {
             check_param(&param, value)?;
@@ -596,8 +684,12 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
         }
         RestoreAsset { asset } => {
             let id = asset.id;
-            p.assets.insert(id, asset);
-            done(vec![RemoveAsset { asset: id }], cmd.clone(), None, format!("素材 {id} を復元"))
+            // 既にあれば置き換え(文字の変更の取り消し)、無ければ追加(削除の取り消し)
+            let inverse = match p.assets.insert(id, asset) {
+                Some(old) => RestoreAsset { asset: old },
+                None => RemoveAsset { asset: id },
+            };
+            done(vec![inverse], cmd.clone(), None, format!("素材 {id} を復元"))
         }
         RestoreParam { clip, param, state } => {
             let (t, ci) = clip_mut(p, clip)?;

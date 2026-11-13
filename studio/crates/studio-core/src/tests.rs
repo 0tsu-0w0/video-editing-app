@@ -282,3 +282,73 @@ fn commands_from_ai_style_json() {
     let h = serde_json::to_string(&ed.history().last().unwrap().forward).unwrap();
     assert!(h.contains(&format!("\"id\":{}", id.0)), "{h}");
 }
+
+#[test]
+fn merged_edits_undo_as_one() {
+    let (mut ed, v1, _v2, _a1, movie, _img) = setup();
+    let c = ed.execute(AddClip { track: v1, asset: movie, start: s(0.0), duration: Some(s(4.0)), source_in: None, id: None }, Origin::User).unwrap().created[0];
+    let before = ed.project.clone();
+    let n = ed.history().len();
+    let w = std::time::Duration::from_secs(5);
+    for v in [10.0, 20.0, 30.0] {
+        ed.transaction_merged("x", vec![SetParam { clip: c, param: "x".into(), value: v }], Origin::User, "x:1", w).unwrap();
+    }
+    ed.transaction_merged("f", vec![SetFade { clip: c, fade_in: Some(s(0.5)), fade_out: Some(s(1.0)) }], Origin::User, "fade", w).unwrap();
+    assert_eq!(ed.history().len(), n + 2, "同じ目印の変更は 1 つにまとまる");
+    assert_eq!(ed.project.clip(c).unwrap().params.x.value, 30.0);
+    ed.undo();
+    assert_eq!(ed.project.clip(c).unwrap().fade_in, Time::ZERO);
+    ed.undo();
+    assert_eq!(ed.project, before);
+    ed.redo();
+    assert_eq!(ed.project.clip(c).unwrap().params.x.value, 30.0);
+}
+
+#[test]
+fn fades_validate_survive_split_and_trim() {
+    let (mut ed, v1, _v2, _a1, movie, _img) = setup();
+    let c = ed.execute(AddClip { track: v1, asset: movie, start: s(0.0), duration: Some(s(4.0)), source_in: None, id: None }, Origin::User).unwrap().created[0];
+    assert!(ed.execute(SetFade { clip: c, fade_in: Some(s(3.0)), fade_out: Some(s(2.0)) }, Origin::Ai).is_err());
+    ed.execute(SetFade { clip: c, fade_in: Some(s(1.0)), fade_out: Some(s(1.0)) }, Origin::User).unwrap();
+    let cl = ed.project.clip(c).unwrap().clone();
+    assert!((cl.fade_gain(s(0.5)) - 0.5).abs() < 1e-9 && (cl.fade_gain(s(2.0)) - 1.0).abs() < 1e-9 && (cl.fade_gain(s(3.75)) - 0.25).abs() < 1e-9);
+    assert!((layers_at(&ed.project, s(0.25))[0].opacity - 0.25).abs() < 1e-9);
+    // 分割: 左はフェードインだけ、右はフェードアウトだけ
+    let r = ed.execute(SplitClip { clip: c, at: s(2.0), new_id: None }, Origin::User).unwrap().created[0];
+    let (l, rr) = (ed.project.clip(c).unwrap().clone(), ed.project.clip(r).unwrap().clone());
+    assert_eq!((l.fade_in, l.fade_out, rr.fade_in, rr.fade_out), (s(1.0), Time::ZERO, Time::ZERO, s(1.0)));
+    // 短くすると、フェードも収まるよう縮む。取り消すと元に戻る
+    ed.execute(TrimClip { clip: r, start: None, duration: Some(s(0.5)), source_in: None }, Origin::User).unwrap();
+    assert_eq!(ed.project.clip(r).unwrap().fade_out, s(0.5));
+    ed.undo();
+    assert_eq!(ed.project.clip(r).unwrap().fade_out, s(1.0));
+    ed.project.check().unwrap();
+}
+
+#[test]
+fn text_assets_and_set_text() {
+    let (mut ed, v1, _v2, _a1, _movie, _img) = setup();
+    let cmds: Vec<Command> = serde_json::from_str(r#"[{"command": "import_asset", "name": "文字", "path": "", "kind": {"type": "text", "text": "こんにちは", "style": {"size": 96}}}]"#).unwrap();
+    let a = ed.transaction("文字", cmds, Origin::Ai).unwrap().created[0];
+    let c = ed.execute(AddClip { track: v1, asset: a, start: s(0.0), duration: None, source_in: None, id: None }, Origin::User).unwrap().created[0];
+    assert_eq!(ed.project.clip(c).unwrap().duration, s(5.0));
+    ed.execute(SetText { asset: a, text: Some("さようなら".into()), font: None, size: Some(40.0), color: Some("#FF000080".into()), outline: None, outline_color: None, align: None }, Origin::User).unwrap();
+    match &ed.project.assets[&a].kind {
+        AssetKind::Text { text, style } => assert_eq!((text.as_str(), style.size, style.color.as_str()), ("さようなら", 40.0, "#FF000080")),
+        _ => panic!(),
+    }
+    for bad in [
+        SetText { asset: a, text: None, font: None, size: Some(0.0), color: None, outline: None, outline_color: None, align: None },
+        SetText { asset: a, text: None, font: None, size: None, color: Some("red".into()), outline: None, outline_color: None, align: None },
+        SetText { asset: a, text: None, font: Some("../../x".into()), size: None, color: None, outline: None, outline_color: None, align: None },
+    ] {
+        assert!(ed.execute(bad, Origin::Ai).is_err());
+    }
+    ed.undo();
+    match &ed.project.assets[&a].kind {
+        AssetKind::Text { text, style } => assert_eq!((text.as_str(), style.size), ("こんにちは", 96.0)),
+        _ => panic!(),
+    }
+    ed.project.check().unwrap();
+    assert_eq!(Project::from_json(&ed.project.to_json()).unwrap(), ed.project);
+}

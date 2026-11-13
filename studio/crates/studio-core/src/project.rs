@@ -39,6 +39,66 @@ pub enum AssetKind {
     Audio { duration: Time, sample_rate: u32, channels: u32 },
     /// 静止画(長さの制限なし)
     Image { width: u32, height: u32 },
+    /// 文字(長さの制限なし)。ファイルは持たない
+    Text {
+        text: String,
+        #[serde(default)]
+        style: TextStyle,
+    },
+}
+
+/// 文字の見た目。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextStyle {
+    /// フォント(Windows のフォントファイル名。例: "meiryo", "YuGothB", "msgothic")
+    pub font: String,
+    /// 文字の大きさ(ピクセル)
+    pub size: f32,
+    /// 文字の色 "#RRGGBB" または "#RRGGBBAA"
+    pub color: String,
+    /// 縁取りの太さ(ピクセル、0 で無し)
+    pub outline: f32,
+    pub outline_color: String,
+    /// 行の揃え: "left" / "center" / "right"
+    pub align: String,
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self { font: "meiryo".into(), size: 72.0, color: "#FFFFFF".into(), outline: 0.0, outline_color: "#000000".into(), align: "center".into() }
+    }
+}
+
+/// "#RRGGBB" / "#RRGGBBAA" を RGBA に。
+pub fn parse_rgba(s: &str) -> Option<[u8; 4]> {
+    let h = s.strip_prefix('#')?;
+    if !(h.len() == 6 || h.len() == 8) || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some([b(0)?, b(2)?, b(4)?, if h.len() == 8 { b(6)? } else { 255 }])
+}
+
+impl TextStyle {
+    pub fn check(&self) -> Result<(), String> {
+        if !(4.0..=1000.0).contains(&self.size) {
+            return Err("文字の大きさは 4〜1000 にしてください".into());
+        }
+        if !(0.0..=100.0).contains(&self.outline) {
+            return Err("縁取りの太さは 0〜100 にしてください".into());
+        }
+        if parse_rgba(&self.color).is_none() || parse_rgba(&self.outline_color).is_none() {
+            return Err("色は \"#RRGGBB\" か \"#RRGGBBAA\" で指定してください".into());
+        }
+        if !["left", "center", "right"].contains(&self.align.as_str()) {
+            return Err("align は left / center / right のいずれかにしてください".into());
+        }
+        if self.font.is_empty() || self.font.len() > 64 || !self.font.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err("font はフォントファイル名(英数字。例: meiryo)で指定してください".into());
+        }
+        Ok(())
+    }
 }
 
 impl AssetKind {
@@ -46,7 +106,7 @@ impl AssetKind {
     pub fn duration(&self) -> Option<Time> {
         match self {
             AssetKind::Video { duration, .. } | AssetKind::Audio { duration, .. } => Some(*duration),
-            AssetKind::Image { .. } => None,
+            AssetKind::Image { .. } | AssetKind::Text { .. } => None,
         }
     }
     pub fn has_video(&self) -> bool {
@@ -239,9 +299,31 @@ pub struct Clip {
     pub source_in: Time,
     #[serde(default)]
     pub params: ClipParams,
+    /// フェードイン・フェードアウトの長さ(映像は不透明度、音声は音量に効く)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fade_in: Time,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fade_out: Time,
+}
+
+fn is_zero(t: &Time) -> bool {
+    t.0 == 0
 }
 
 impl Clip {
+    /// クリップ内の時刻 local でのフェードの倍率(0〜1)。
+    pub fn fade_gain(&self, local: Time) -> f64 {
+        let mut g = 1.0f64;
+        if self.fade_in.0 > 0 && local < self.fade_in {
+            g *= (local.0.max(0) as f64 / self.fade_in.0 as f64).clamp(0.0, 1.0);
+        }
+        let rest = self.duration - local;
+        if self.fade_out.0 > 0 && rest < self.fade_out {
+            g *= (rest.0.max(0) as f64 / self.fade_out.0 as f64).clamp(0.0, 1.0);
+        }
+        g
+    }
+
     pub fn end(&self) -> Time {
         self.start + self.duration
     }
@@ -331,6 +413,9 @@ impl Project {
                     return Err(format!("クリップ {} の ID が不正です", c.id));
                 }
                 let a = self.assets.get(&c.asset).ok_or(format!("クリップ {} の素材がありません", c.id))?;
+                if c.fade_in < Time::ZERO || c.fade_out < Time::ZERO || c.fade_in + c.fade_out > c.duration {
+                    return Err(format!("クリップ {} のフェードが長さを超えています", c.id));
+                }
                 if c.duration <= Time::ZERO || c.start < Time::ZERO || c.source_in < Time::ZERO {
                     return Err(format!("クリップ {} の時間が不正です", c.id));
                 }
