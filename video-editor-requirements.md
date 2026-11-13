@@ -74,9 +74,9 @@ AviUtl2 と同等の範囲は、個人開発では年単位になる。ロード
 | GPU | **Direct3D 11 に統一** | **Phase 0 で確定。** wgpu では Forge の HLSL が使えない(SDK の DXC が SPIR-V 非対応)。D3D11 なら UI・エフェクト・動画デコードが1つのデバイスで共有できる |
 | 動画のデコード/エンコード | **Media Foundation(Windows 標準)**。FFmpeg は追加形式用の任意部品 | **Phase 0 で確定。** H.264/HEVC/VP9/AV1 の読み書きをハードウェアで確認(書き出し 15 倍速、読み込み 1219fps、音ズレ 最大 10ms) |
 | 音声デバイス | cpal(WASAPI)、デコードは FFmpeg か symphonia、再サンプルは rubato | 自前ミキサー(f32) |
-| 3D | `gltf` クレートで読み込み、自前の PBR 描画(影・IBL)。VRM は glTF 拡張として対応 | アニメ系キャラは VRM が主流 |
-| 画像処理・トラッキング | OpenCV(`opencv` クレート)または Rust 実装。ビルドの重さが課題 | 点: KLT、平面: 特徴点+ホモグラフィ |
-| 推論 | ONNX Runtime(`ort`)+ DirectML | 人物姿勢・人物切り抜き・深度・音声認識を端末内で動かす |
+| 3D | `gltf` クレートで読み込み、自前の PBR 描画(影・IBL)。VRM は glTF 拡張として対応 | **Phase 0 で確認。** 骨アニメーション付き 10 万三角形で 0.27ms |
+| 画像処理・トラッキング | **Rust 実装(OpenCV 不使用)** | **Phase 0 で確定。** 点: ピラミッド LK(誤差 0.42px)、平面: 特徴点+RANSAC ホモグラフィ(四隅 0.34px) |
+| 推論 | ONNX Runtime(`ort`)。CPU 実行を既定、DirectML は選択式 | **Phase 0 で確認。** 人物検出 13.5ms + 姿勢 19.5ms(CPU)。姿勢モデルの重みのライセンスは要確認 |
 | プロジェクト形式 | JSON(テキスト、版付き) | 差分が見やすく、AI も読める |
 
 ### 3.2 Forge との関係
