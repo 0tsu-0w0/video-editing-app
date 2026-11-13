@@ -71,6 +71,16 @@ struct ExportJob {
     path: PathBuf,
 }
 
+/// トラッキングの進み具合(別スレッドと共有)。
+struct TrackJob {
+    done: Arc<AtomicI64>,
+    total: Arc<AtomicI64>,
+    cancel: Arc<AtomicBool>,
+    /// 完成した追従のコマンドと、結果の説明
+    result: Arc<Mutex<Option<Result<(Vec<Command>, String), String>>>>,
+    from_mcp: bool,
+}
+
 struct Studio {
     editor: Editor,
     path: Option<PathBuf>,
@@ -88,6 +98,10 @@ struct Studio {
     control: Option<control::ControlServer>,
     mcp_mode: McpMode,
     pending: VecDeque<Pending>,
+    track_job: Option<TrackJob>,
+    /// プレビューのクリックで追跡点を指定するのを待っている、追従させるクリップ
+    pick_track: Option<Id>,
+    last_track_result: String,
 }
 
 impl Studio {
@@ -133,6 +147,9 @@ impl Studio {
             control,
             mcp_mode,
             pending: VecDeque::new(),
+            track_job: None,
+            pick_track: None,
+            last_track_result: String::new(),
         }
     }
 
@@ -403,6 +420,22 @@ impl Studio {
                 // ファイルを書くので、権限の設定に関わらず必ず確認する
                 Handled::NeedsApproval("動画の書き出し".into(), summary, PendingAction::Export(path))
             }
+            "track_follow" => {
+                if self.mcp_mode == McpMode::ReadOnly {
+                    return Done(Err("閲覧のみの設定です。アプリ上部の「外部からの操作」で変更できます".into()));
+                }
+                let clip = params.get("clip").and_then(|c| c.as_u64()).map(Id);
+                let (x, y) = (params.get("x").and_then(|v| v.as_f64()), params.get("y").and_then(|v| v.as_f64()));
+                let (Some(clip), Some(x), Some(y)) = (clip, x, y) else {
+                    return Done(Err("clip(追従させるクリップ ID)と x, y(画面中央を原点とする画素、y は下向き)を指定してください".into()));
+                };
+                let from = params.get("time").cloned().and_then(|v| serde_json::from_value::<TimeArg>(v).ok()).map(|t| t.0).unwrap_or(self.playhead);
+                Done(self.start_tracking(clip, (x, y), from, true).map(|m| json!(format!("{m}。track_status で進み具合と結果を確認できます"))))
+            }
+            "track_status" => Done(Ok(match &self.track_job {
+                Some(j) => json!({"tracking": true, "done": j.done.load(Ordering::Relaxed), "total": j.total.load(Ordering::Relaxed)}),
+                None => json!({"tracking": false, "last_result": self.last_track_result}),
+            })),
             "export_status" => Done(Ok(match &self.export {
                 Some(j) => json!({"exporting": true, "done": j.done.load(Ordering::Relaxed), "total": j.total.load(Ordering::Relaxed)}),
                 None => json!({"exporting": false, "last_status": self.status}),
@@ -476,6 +509,83 @@ impl Studio {
                 }
             };
             let _ = p.reply.send(r);
+        }
+    }
+
+    /// `target` を、その下の動画の画面上の点 `screen`(中央原点の画素)の動きに追従させる解析を始める。
+    fn start_tracking(&mut self, target: Id, screen: (f64, f64), from: Time, from_mcp: bool) -> Result<String, String> {
+        if self.track_job.is_some() {
+            return Err("トラッキングの実行中です".into());
+        }
+        let p = self.editor.project.clone();
+        let tc = p.clip(target).ok_or("追従させるクリップがありません")?.clone();
+        if !tc.contains(from) {
+            return Err(format!("再生位置({from})が、追従させるクリップの表示範囲({}〜{})の外です", tc.start, tc.end()));
+        }
+        let source = studio_track::source_below(&p, target, from).ok_or("このクリップより下のトラックに、再生位置で表示されている動画がありません")?;
+        let src_px = studio_track::screen_to_source(&p, source, from, screen).ok_or("指定した点は、下の動画の範囲の外です")?;
+        let job = TrackJob {
+            done: Arc::new(AtomicI64::new(0)),
+            total: Arc::new(AtomicI64::new(1)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            result: Arc::new(Mutex::new(None)),
+            from_mcp,
+        };
+        let (done, total, cancel, result) = (job.done.clone(), job.total.clone(), job.cancel.clone(), job.result.clone());
+        std::thread::spawn(move || {
+            let r = (|| {
+                let sc = p.clip(source).unwrap();
+                let path = PathBuf::from(&p.assets[&sc.asset].path);
+                let mut reader = studio_media::VideoReader::open(&path).map_err(|e| e.to_string())?;
+                let f = reader.frame_at(sc.source_in + (from - sc.start)).map_err(|e| e.to_string())?;
+                // 平らな場所をクリックしても、近くの追跡しやすい点に吸着させる
+                let start = studio_track::best_point_near(&f.bgra, f.width, f.height, src_px, 24.0);
+                let tr = studio_track::track_point(&p, source, from, tc.end(), start, |d, t| {
+                    done.store(d as i64, Ordering::Relaxed);
+                    total.store(t as i64, Ordering::Relaxed);
+                    !cancel.load(Ordering::Relaxed)
+                })?;
+                let ok = tr.iter().filter(|k| k.pos.is_some()).count();
+                let lost = tr.iter().find(|k| k.pos.is_none()).map(|k| k.time);
+                let cmds = studio_track::follow_commands(&p, target, source, &tr)?;
+                let msg = match lost {
+                    Some(t) => format!("{ok} フレームを追跡し、{t} で見失ったのでそこで止めました(以降は手で調整してください)"),
+                    None => format!("{ok} フレームを追跡し、クリップ {target} を追従させました"),
+                };
+                Ok((cmds, msg))
+            })();
+            *result.lock().unwrap() = Some(r);
+        });
+        self.track_job = Some(job);
+        Ok(format!("クリップ {target} の追従を解析中(追跡元: クリップ {source})"))
+    }
+
+    /// 終わったトラッキングの結果を反映する。
+    fn finish_tracking(&mut self) {
+        let Some(job) = &self.track_job else { return };
+        let Some(r) = job.result.lock().unwrap().take() else { return };
+        let from_mcp = job.from_mcp;
+        self.track_job = None;
+        match r {
+            Ok((cmds, msg)) => {
+                if from_mcp && self.mcp_mode == McpMode::Ask {
+                    let summary = self.editor.dry_run(&cmds).map(|o| vec![msg.clone(), format!("キーフレーム {} 個を設定", o.summary.len().saturating_sub(2))]).unwrap_or_else(|e| vec![e.to_string()]);
+                    let (tx, _rx) = std::sync::mpsc::channel();
+                    self.pending.push_back(Pending { title: "トラッキングによる追従".into(), summary, action: PendingAction::Commands { label: "トラッキング追従".into(), commands: cmds }, reply: tx });
+                    self.last_track_result = format!("{msg}(承認待ち)");
+                } else {
+                    let origin = if from_mcp { Origin::Mcp } else { Origin::User };
+                    match self.editor.transaction("トラッキング追従", cmds, origin) {
+                        Ok(_) => self.last_track_result = msg.clone(),
+                        Err(e) => self.last_track_result = format!("追従を設定できません: {}", e.error.message),
+                    }
+                }
+                self.status = self.last_track_result.clone();
+            }
+            Err(e) => {
+                self.last_track_result = format!("トラッキングできませんでした: {e}");
+                self.status = self.last_track_result.clone();
+            }
         }
     }
 
@@ -615,9 +725,18 @@ impl Studio {
                     }
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 }
+                if let Some(job) = &self.track_job {
+                    let (d, t) = (job.done.load(Ordering::Relaxed), job.total.load(Ordering::Relaxed).max(1));
+                    ui.add(egui::ProgressBar::new(d as f32 / t as f32).desired_width(200.0).text(format!("トラッキング中 {d}/{t}")));
+                    if ui.button("中止").clicked() {
+                        job.cancel.store(true, Ordering::Relaxed);
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
                 ui.label(&self.status);
             });
         });
+        self.finish_tracking();
         let finished = self.export.as_ref().and_then(|job| {
             let r = job.result.lock().unwrap().take();
             r.map(|r| (r, job.path.clone()))
@@ -749,6 +868,17 @@ impl Studio {
             self.run(&l, vec![c]);
         }
         ui.separator();
+        let on_video = self.editor.project.find_clip(id).is_some_and(|(ti, _)| self.editor.project.tracks[ti].kind == TrackKind::Video);
+        if on_video {
+            let picking = self.pick_track == Some(id);
+            let label = if picking { "クリックを待っています(取り消す)" } else { "点を追跡して追従させる" };
+            if ui.add_enabled(self.track_job.is_none(), egui::Button::new(label)).on_hover_text("下のトラックの動画の上で追いたい点をプレビューでクリックすると、このクリップがその動きに合わせて動きます(再生位置からクリップの終わりまで)").clicked() {
+                self.pick_track = if picking { None } else { Some(id) };
+                if !picking {
+                    self.status = "プレビュー上で、追いかけたい点(模様のはっきりした所)をクリックしてください".into();
+                }
+            }
+        }
         if ui.button("このクリップを削除").clicked() {
             self.selected = None;
             self.run("削除", vec![RemoveClip { clip: id }]);
@@ -802,7 +932,21 @@ impl Studio {
         let size = egui::vec2(pw * scale, ph * scale);
         if let Some((tid, k)) = self.preview {
             if k == key {
-                ui.centered_and_justified(|ui| ui.add(egui::Image::from_texture((tid, size))));
+                let (area, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+                let img = egui::Rect::from_center_size(area.center(), size);
+                ui.painter().image(tid, img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                if let Some(target) = self.pick_track {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    ui.painter().rect_stroke(img, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 0)), egui::StrokeKind::Outside);
+                    if let Some(pos) = resp.clicked().then(|| resp.interact_pointer_pos()).flatten().filter(|p| img.contains(*p)) {
+                        let screen = (((pos.x - img.center().x) / scale) as f64, ((pos.y - img.center().y) / scale) as f64);
+                        self.pick_track = None;
+                        self.status = match self.start_tracking(target, screen, self.playhead, false) {
+                            Ok(m) => m,
+                            Err(e) => e,
+                        };
+                    }
+                }
                 return;
             }
         }

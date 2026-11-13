@@ -45,6 +45,11 @@ fn tools() -> Value {
         {"name": "export_video", "description": "MP4(H.264 + AAC)に書き出す。必ず利用者の承認が必要。開始後は export_status で進み具合を確認する",
          "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string", "description": "書き出し先の .mp4 の絶対パス"}}}},
         {"name": "export_status", "description": "書き出しの進み具合", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "track_follow", "description": "クリップ(clip)を、その下のトラックの動画上の点の動きに追従させる。点は画面上の位置(画面中央が原点の画素、y は下向き)で、time の時点の画面で指定する。time からクリップの終わりまで追跡し、x / y のキーフレームを設定する。解析は裏で進むので track_status で結果を確認する。render_frame で画面を見て、模様のはっきりした点を選ぶとよい",
+         "inputSchema": {"type": "object", "required": ["clip", "x", "y"], "properties": {
+             "clip": {"type": "integer", "description": "追従させるクリップの ID"},
+             "x": {"type": "number"}, "y": {"type": "number"}, "time": time}}},
+        {"name": "track_status", "description": "トラッキングの進み具合と、最後の結果", "inputSchema": {"type": "object", "properties": {}}},
     ])
 }
 
@@ -64,6 +69,8 @@ fn method_of(tool: &str) -> Option<&'static str> {
         "redo" => "redo",
         "export_video" => "export",
         "export_status" => "export_status",
+        "track_follow" => "track_follow",
+        "track_status" => "track_status",
         _ => return None,
     })
 }

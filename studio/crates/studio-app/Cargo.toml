@@ -11,6 +11,7 @@ path = "src/main.rs"
 studio-core = { path = "../studio-core" }
 studio-media = { path = "../studio-media" }
 studio-render = { path = "../studio-render" }
+studio-track = { path = "../studio-track" }
 egui = "0.35"
 egui-directx11 = "0.13"
 egui-winit = { version = "0.35", default-features = false }

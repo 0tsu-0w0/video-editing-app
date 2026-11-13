@@ -10,8 +10,17 @@ AviUtl2 のような動画編集ソフト。Rust + Direct3D 11 + egui + Media Fo
 - プレビュー再生(音声デバイスの時計に映像を合わせる)、コマ送り
 - Undo / Redo(全操作)、プロジェクトの保存・読み込み(`.fsproj`、JSON)
 - MP4(H.264 + AAC)への書き出し(別スレッド、進捗表示・中止)
+- **点トラッキングによる追従**: クリップを選んで「点を追跡して追従させる」を押し、下の動画の追いたい点をプレビューでクリックすると、
+  再生位置からクリップの終わりまで点を追い、x / y のキーフレームとして追従させる(1 回の Ctrl+Z で取り消せる)。
+  平らな場所をクリックしても、近くの模様のはっきりした点に吸着する。見失ったらそこで止める
 
 ![Phase 1 の画面](docs/phase1-screenshot.png)
+
+トラッキングの確認(模様が右上へ流れる動画。赤い点を模様に追従させた 0.5 秒目と 3.4 秒目):
+![追従](docs/tracking-follow.png)
+
+精度: 動きが分かっている動画(H.264)で、60 フレームの最大誤差 0.02px(テスト)、
+1280×720 の動画で 90 フレーム後の誤差 1px 未満(MCP 経由の実機確認)。
 
 ## Claude から操作する(MCP)
 
@@ -52,6 +61,7 @@ Claude Desktop(`claude_desktop_config.json`):
 | `render_frame` | 任意の時刻の画面を画像で返す |
 | `seek` / `play` / `stop` / `undo` / `redo` | 再生位置・再生・取り消し |
 | `export_video` / `export_status` | MP4 に書き出す(必ず承認が必要) |
+| `track_follow` / `track_status` | クリップを、下の動画上の点の動きに追従させる(画面上の位置で点を指定) |
 
 ## 操作
 
@@ -76,6 +86,7 @@ Claude Desktop(`claude_desktop_config.json`):
 | `studio-media` | Media Foundation での読み込み・シーク・音声取得・書き出し |
 | `studio-render` | D3D11 での合成、音声ミックス、書き出しの処理 |
 | `studio-app` | アプリ本体(ウィンドウ、UI、タイムライン、再生エンジン、外部操作の受付口) |
+| `studio-track` | 点トラッキング(ピラミッド Lucas-Kanade、往復チェック、見失いの検出)と、追従のキーフレーム作成 |
 | `studio-mcp` | Claude が起動する MCP サーバー(`forge-studio-mcp.exe`)。アプリの受付口へ取り次ぐ |
 
 ## ビルドとテスト
