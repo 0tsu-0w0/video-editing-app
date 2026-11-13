@@ -29,7 +29,7 @@ API の従量課金は不要で、手持ちの Claude から使える。
 Claude Code:
 
 ```
-claude mcp add forge-studio -- "C:\path	oorge-studio-mcp.exe"
+claude mcp add forge-studio -- "C:\path\to\forge-studio-mcp.exe"
 ```
 
 Claude Desktop(`claude_desktop_config.json`):
