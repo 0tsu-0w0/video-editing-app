@@ -102,6 +102,12 @@ struct Studio {
     /// プレビューのクリックで追跡点を指定するのを待っている、追従させるクリップ
     pick_track: Option<Id>,
     last_track_result: String,
+    /// 言葉での編集(手動ブリッジ)
+    ai_instruction: String,
+    ai_reply: String,
+    ai_preview: Option<Result<(Vec<Command>, Vec<String>), String>>,
+    /// 音声素材の波形(1 秒あたり 100 個の最大振幅)。裏で計算する
+    waves: std::collections::HashMap<Id, Arc<Mutex<Option<Vec<f32>>>>>,
 }
 
 impl Studio {
@@ -150,6 +156,10 @@ impl Studio {
             track_job: None,
             pick_track: None,
             last_track_result: String::new(),
+            ai_instruction: String::new(),
+            ai_reply: String::new(),
+            ai_preview: None,
+            waves: std::collections::HashMap::new(),
         }
     }
 
@@ -589,6 +599,106 @@ impl Studio {
         }
     }
 
+    /// 音声を持つ素材の波形を、まだなら裏で計算し始める。計算済みのものを返す。
+    fn waveforms(&mut self) -> std::collections::HashMap<Id, Arc<Vec<f32>>> {
+        let mut out = std::collections::HashMap::new();
+        for a in self.editor.project.assets.values() {
+            if !a.kind.has_audio() {
+                continue;
+            }
+            let slot = self.waves.entry(a.id).or_insert_with(|| {
+                let slot = Arc::new(Mutex::new(None));
+                let (s2, path, dur) = (slot.clone(), PathBuf::from(&a.path), a.kind.duration().unwrap_or(Time::ZERO));
+                std::thread::spawn(move || {
+                    const RATE: u32 = 8000;
+                    const PER: usize = 80; // 1 秒に 100 個
+                    let Ok(mut r) = studio_media::AudioReader::open(&path, RATE) else {
+                        *s2.lock().unwrap() = Some(vec![]);
+                        return;
+                    };
+                    let total = studio_core::time::time_to_sample(dur, RATE).max(0) as usize;
+                    let mut peaks = Vec::with_capacity(total / PER + 1);
+                    let mut pos = 0usize;
+                    while pos < total {
+                        let n = (RATE as usize * 10).min(total - pos);
+                        let Ok(buf) = r.read(pos as i64, n) else { break };
+                        for ch in buf.chunks(PER * 2) {
+                            peaks.push(ch.iter().fold(0.0f32, |m, v| m.max(v.abs())));
+                        }
+                        pos += n;
+                    }
+                    *s2.lock().unwrap() = Some(peaks);
+                });
+                slot
+            });
+            if let Some(v) = slot.lock().unwrap().as_ref() {
+                out.insert(a.id, Arc::new(v.clone()));
+            }
+        }
+        out
+    }
+
+    /// 言葉での編集の欄。依頼文をコピー → 手持ちの AI に貼る → 返答を貼って取り込む → 確認して実行。
+    fn ai_panel(&mut self, ui: &mut egui::Ui) {
+        ui.weak("やりたいことを書いて依頼文をコピーし、Claude などに貼り付けてください。返答を下に貼ると、内容を確認してから実行できます。");
+        ui.add(egui::TextEdit::multiline(&mut self.ai_instruction).desired_rows(3).desired_width(f32::INFINITY).hint_text("例: 1 秒目から「はじめまして」という文字を、下からふわっと出して"));
+        if ui.add_enabled(!self.ai_instruction.trim().is_empty(), egui::Button::new("依頼文をコピー")).clicked() {
+            ui.ctx().copy_text(studio_core::ai::edit_request(&self.editor.project, self.playhead, self.selected, &self.ai_instruction));
+            self.status = "依頼文をコピーしました。AI に貼り付けて、返答をこの下に貼ってください".into();
+        }
+        ui.add(egui::TextEdit::multiline(&mut self.ai_reply).desired_rows(3).desired_width(f32::INFINITY).hint_text("AI の返答を貼り付け").font(egui::TextStyle::Monospace));
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.ai_reply.trim().is_empty(), egui::Button::new("取り込む")).clicked() {
+                self.ai_preview = Some(studio_core::ai::extract_commands(&self.ai_reply).and_then(|c| match self.editor.dry_run(&c) {
+                    Ok(o) => Ok((c, o.summary)),
+                    Err(e) => Err(e.to_string()),
+                }));
+            }
+            if ui.button("消す").clicked() {
+                self.ai_reply.clear();
+                self.ai_preview = None;
+            }
+        });
+        let mut run = None;
+        match &self.ai_preview {
+            Some(Ok((cmds, summary))) => {
+                ui.label(egui::RichText::new("実行すると、次のように変わります").strong());
+                for l in summary {
+                    ui.label(format!("・{l}"));
+                }
+                if ui.button("実行する").clicked() {
+                    run = Some(cmds.clone());
+                }
+            }
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+                if ui.button("修正依頼をコピー").clicked() {
+                    ui.ctx().copy_text(studio_core::ai::repair_request(&self.ai_reply, e));
+                    self.status = "修正依頼をコピーしました。AI に貼り付けて、新しい返答を貼ってください".into();
+                }
+            }
+            None => {}
+        }
+        if let Some(cmds) = run {
+            let label = format!("AI: {}", self.ai_instruction.trim().chars().take(30).collect::<String>());
+            match self.editor.transaction(&label, cmds, Origin::Ai) {
+                Ok(o) => {
+                    self.status = format!("AI の編集を実行しました: {}", o.summary.join(" / "));
+                    self.ai_preview = None;
+                    self.ai_reply.clear();
+                }
+                Err(e) => self.ai_preview = Some(Err(e.to_string())),
+            }
+        }
+    }
+
+    fn add_text(&mut self) {
+        let kind = AssetKind::Text { text: "テキスト".into(), style: studio_core::project::TextStyle { outline: 4.0, ..Default::default() } };
+        if let Some(created) = self.run("文字の追加", vec![ImportAsset { name: "文字「テキスト」".into(), path: String::new(), kind, id: None }]) {
+            self.place_asset(created[0]);
+        }
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
             return;
@@ -701,6 +811,9 @@ impl Studio {
                 if ui.button("+ 音声トラック").clicked() {
                     self.run("トラック追加", vec![AddTrack { kind: TrackKind::Audio, name: None, index: None, id: None }]);
                 }
+                if ui.button("+ 文字").clicked() {
+                    self.add_text();
+                }
                 ui.separator();
                 if ui.add_enabled(self.export.is_none(), egui::Button::new("書き出し")).clicked() {
                     self.start_export();
@@ -752,7 +865,8 @@ impl Studio {
         egui::Panel::bottom("timeline").resizable(true).default_size(240.0).min_size(120.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let playing = self.audio.is_playing();
-                let actions = self.timeline.show(ui, &self.editor.project, self.playhead, self.selected, playing);
+                let waves = self.waveforms();
+                let actions = self.timeline.show(ui, &self.editor.project, self.playhead, self.selected, playing, &waves);
                 for a in actions {
                     match a {
                         Action::Seek(t) => self.seek(t),
@@ -771,12 +885,14 @@ impl Studio {
             ui.weak("ファイルをウィンドウにドロップしても読み込めます");
             let mut place = None;
             let mut remove = None;
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            let list_h = (ui.available_height() * 0.45).max(120.0);
+            egui::ScrollArea::vertical().id_salt("asset_list").max_height(list_h).show(ui, |ui| {
                 for a in self.editor.project.assets.values() {
                     let kind = match &a.kind {
                         AssetKind::Video { width, height, duration, .. } => format!("動画 {width}×{height} {duration}"),
                         AssetKind::Audio { duration, .. } => format!("音声 {duration}"),
                         AssetKind::Image { width, height } => format!("画像 {width}×{height}"),
+                        AssetKind::Text { text, .. } => format!("文字 {}", text.chars().take(16).collect::<String>().replace('\n', " ")),
                     };
                     ui.group(|ui| {
                         ui.label(&a.name);
@@ -798,6 +914,10 @@ impl Studio {
             if let Some(a) = remove {
                 self.run("素材の削除", vec![RemoveAsset { asset: a }]);
             }
+            ui.separator();
+            egui::ScrollArea::vertical().id_salt("ai_panel").show(ui, |ui| {
+                egui::CollapsingHeader::new(egui::RichText::new("AI に頼む(言葉で編集)").strong()).default_open(true).show(ui, |ui| self.ai_panel(ui));
+            });
         });
 
         egui::Panel::right("inspector").resizable(true).default_size(260.0).show(ui, |ui| self.inspector(ui));
@@ -823,6 +943,73 @@ impl Studio {
         ui.heading(format!("クリップ {id}"));
         ui.label(asset);
         ui.label(format!("{} 〜 {}(長さ {})", clip.start, clip.end(), clip.duration));
+        ui.separator();
+        // 文字の内容と見た目
+        if let Some(studio_core::Asset { kind: AssetKind::Text { text, style }, .. }) = self.editor.project.assets.get(&clip.asset).cloned() {
+            let aid = clip.asset;
+            let mut t = text.clone();
+            let mut st = style.clone();
+            let mut changed = false;
+            changed |= ui.add(egui::TextEdit::multiline(&mut t).desired_rows(2).desired_width(f32::INFINITY)).changed();
+            ui.horizontal(|ui| {
+                ui.label("大きさ");
+                changed |= ui.add(egui::DragValue::new(&mut st.size).range(4.0..=1000.0).speed(1.0)).changed();
+                ui.label("縁取り");
+                changed |= ui.add(egui::DragValue::new(&mut st.outline).range(0.0..=100.0).speed(0.2)).changed();
+            });
+            ui.horizontal(|ui| {
+                let color = |ui: &mut egui::Ui, label: &str, hex: &mut String| {
+                    let c = studio_core::project::parse_rgba(hex).unwrap_or([255; 4]);
+                    let mut c32 = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                    ui.label(label);
+                    if ui.color_edit_button_srgba(&mut c32).changed() {
+                        let [r, g, b, a] = c32.to_srgba_unmultiplied();
+                        *hex = format!("#{r:02X}{g:02X}{b:02X}{a:02X}");
+                        return true;
+                    }
+                    false
+                };
+                changed |= color(ui, "色", &mut st.color);
+                changed |= color(ui, "縁の色", &mut st.outline_color);
+            });
+            ui.horizontal(|ui| {
+                for (v, l) in [("left", "左揃え"), ("center", "中央"), ("right", "右揃え")] {
+                    changed |= ui.selectable_value(&mut st.align, v.to_string(), l).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("フォント");
+                egui::ComboBox::from_id_salt("font").selected_text(&st.font).show_ui(ui, |ui| {
+                    for f in ["meiryo", "meiryob", "YuGothM", "YuGothB", "msgothic", "msmincho", "BIZ-UDGothicR", "arial", "impact"] {
+                        changed |= ui.selectable_value(&mut st.font, f.to_string(), f).changed();
+                    }
+                });
+            });
+            if changed {
+                let cmd = SetText { asset: aid, text: Some(t), font: Some(st.font), size: Some(st.size), color: Some(st.color), outline: Some(st.outline), outline_color: Some(st.outline_color), align: Some(st.align) };
+                if let Err(e) = self.editor.transaction_merged("文字の変更", vec![cmd], Origin::User, &format!("text:{aid}"), std::time::Duration::from_secs(2)) {
+                    self.status = format!("できませんでした: {}", e.error.message);
+                }
+            }
+            ui.separator();
+        }
+        // フェード
+        ui.horizontal(|ui| {
+            let (mut fi, mut fo) = (clip.fade_in.secs_f64(), clip.fade_out.secs_f64());
+            let max = clip.duration.secs_f64();
+            ui.label("フェード イン");
+            let a = ui.add(egui::DragValue::new(&mut fi).range(0.0..=max).speed(0.02).suffix(" 秒").fixed_decimals(2)).changed();
+            ui.label("アウト");
+            let b = ui.add(egui::DragValue::new(&mut fo).range(0.0..=max).speed(0.02).suffix(" 秒").fixed_decimals(2)).changed();
+            if a || b {
+                let (fi, fo) = (Time::from_secs_f64(fi), Time::from_secs_f64(fo));
+                // 合計が長さを超えないよう、動かした方に合わせてもう一方を縮める
+                let (fi, fo) = if a { (fi, fo.min(clip.duration - fi)) } else { (fi.min(clip.duration - fo), fo) };
+                if let Err(e) = self.editor.transaction_merged("フェード", vec![SetFade { clip: id, fade_in: Some(fi), fade_out: Some(fo) }], Origin::User, &format!("fade:{id}"), std::time::Duration::from_secs(2)) {
+                    self.status = format!("できませんでした: {}", e.error.message);
+                }
+            }
+        });
         ui.separator();
         let local = (self.playhead - clip.start).max(Time::ZERO).min(clip.duration);
         let labels = [("x", "X 位置"), ("y", "Y 位置"), ("scale", "拡大率"), ("rotation", "回転"), ("opacity", "不透明度"), ("volume", "音量"), ("pan", "パン")];

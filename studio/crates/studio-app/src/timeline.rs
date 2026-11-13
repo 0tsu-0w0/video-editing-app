@@ -85,7 +85,7 @@ impl Timeline {
         p.settings.frame_rate.snap(best.1)
     }
 
-    pub fn show(&mut self, ui: &mut Ui, p: &Project, playhead: Time, selected: Option<Id>, follow: bool) -> Vec<Action> {
+    pub fn show(&mut self, ui: &mut Ui, p: &Project, playhead: Time, selected: Option<Id>, follow: bool, waves: &std::collections::HashMap<Id, std::sync::Arc<Vec<f32>>>) -> Vec<Action> {
         let mut actions = Vec::new();
         // 再生中は、再生位置が見える範囲から出たらページ送りする
         if follow {
@@ -98,7 +98,8 @@ impl Timeline {
         let rows = p.tracks.len().max(1) as f32;
         let size = Vec2::new(ui.available_width(), (RULER_H + rows * ROW_H).max(ui.available_height()));
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
+        // 左右のパネルの境界線より手前に描く(タイムラインの上に線が重ならないように)
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, ui.id().with("timeline_layer"))).with_clip_rect(rect.intersect(ui.clip_rect()));
         let vis = ui.visuals().clone();
         painter.rect_filled(rect, 0.0, vis.extreme_bg_color);
 
@@ -179,6 +180,36 @@ impl Timeline {
                 painter.rect_filled(r, CornerRadius::same(4), clip_color(track.kind, sel));
                 if sel {
                     painter.rect_stroke(r, CornerRadius::same(4), Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
+                }
+                // 音声の波形(1 秒に 100 個の最大振幅)
+                if track.kind == TrackKind::Audio {
+                    if let Some(w) = waves.get(&c.asset) {
+                        let painter = painter.with_clip_rect(r);
+                        let mid = r.center().y;
+                        let half = r.height() / 2.0 - 2.0;
+                        let col = Color32::from_rgba_unmultiplied(220, 255, 230, 150);
+                        let mut x = r.left().max(rect.left() + HEADER_W);
+                        while x < r.right().min(rect.right()) {
+                            let src = c.source_in + (self.t_of(rect, x) - start);
+                            let i = (src.secs_f64() * 100.0) as usize;
+                            let span = ((1.0 / self.zoom as f64) * 100.0).ceil().max(1.0) as usize;
+                            let v = w.get(i..(i + span).min(w.len())).map(|s| s.iter().cloned().fold(0.0f32, f32::max)).unwrap_or(0.0);
+                            let vol = c.params.volume.eval(src - c.source_in).max(0.0) as f32 * c.fade_gain(self.t_of(rect, x) - start) as f32;
+                            let hgt = (v * vol).min(1.0) * half;
+                            painter.line_segment([Pos2::new(x, mid - hgt), Pos2::new(x, mid + hgt)], Stroke::new(1.0, col));
+                            x += 1.0;
+                        }
+                    }
+                }
+                // フェードの三角形
+                let fade_col = Color32::from_rgba_unmultiplied(0, 0, 0, 110);
+                if c.fade_in.0 > 0 {
+                    let fx = self.x_of(rect, start + c.fade_in).min(r.right());
+                    painter.with_clip_rect(r).add(egui::Shape::convex_polygon(vec![r.left_top(), Pos2::new(fx, r.top()), r.left_bottom()], fade_col, Stroke::NONE));
+                }
+                if c.fade_out.0 > 0 {
+                    let fx = self.x_of(rect, start + dur - c.fade_out).max(r.left());
+                    painter.with_clip_rect(r).add(egui::Shape::convex_polygon(vec![Pos2::new(fx, r.top()), r.right_top(), r.right_bottom()], fade_col, Stroke::NONE));
                 }
                 let name = p.assets.get(&c.asset).map(|a| a.name.as_str()).unwrap_or("?");
                 painter.with_clip_rect(r).text(r.left_center() + Vec2::new(5.0, 0.0), Align2::LEFT_CENTER, name, FontId::proportional(12.0), Color32::WHITE);
