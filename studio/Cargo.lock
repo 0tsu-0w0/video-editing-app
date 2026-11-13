@@ -239,6 +239,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "studio-render"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "studio-core",
+ "studio-media",
+ "windows",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
