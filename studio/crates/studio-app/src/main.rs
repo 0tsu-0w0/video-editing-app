@@ -79,6 +79,17 @@ struct TrackJob {
     /// 完成した追従のコマンドと、結果の説明
     result: Arc<Mutex<Option<Result<(Vec<Command>, String), String>>>>,
     from_mcp: bool,
+    /// 履歴に残す名前
+    label: &'static str,
+}
+
+/// プレビューで四隅をクリックして指定する用途。
+#[derive(Clone, Copy, PartialEq)]
+enum PinPick {
+    /// その場に貼る(動かない)
+    Static,
+    /// 下の動画の平面を追跡して貼る
+    Track,
 }
 
 struct Studio {
@@ -101,6 +112,8 @@ struct Studio {
     track_job: Option<TrackJob>,
     /// プレビューのクリックで追跡点を指定するのを待っている、追従させるクリップ
     pick_track: Option<Id>,
+    /// プレビューのクリックで四隅を指定中(貼り付けるクリップ、用途、指定済みの点)
+    pick_corners: Option<(Id, PinPick, Vec<(f64, f64)>)>,
     last_track_result: String,
     /// 言葉での編集(手動ブリッジ)
     ai_instruction: String,
@@ -155,6 +168,7 @@ impl Studio {
             pending: VecDeque::new(),
             track_job: None,
             pick_track: None,
+            pick_corners: None,
             last_track_result: String::new(),
             ai_instruction: String::new(),
             ai_reply: String::new(),
@@ -442,6 +456,18 @@ impl Studio {
                 let from = params.get("time").cloned().and_then(|v| serde_json::from_value::<TimeArg>(v).ok()).map(|t| t.0).unwrap_or(self.playhead);
                 Done(self.start_tracking(clip, (x, y), from, true).map(|m| json!(format!("{m}。track_status で進み具合と結果を確認できます"))))
             }
+            "track_plane" => {
+                if self.mcp_mode == McpMode::ReadOnly {
+                    return Done(Err("閲覧のみの設定です。アプリ上部の「外部からの操作」で変更できます".into()));
+                }
+                let clip = params.get("clip").and_then(|c| c.as_u64()).map(Id);
+                let corners: Option<[[f64; 2]; 4]> = params.get("corners").cloned().and_then(|v| serde_json::from_value(v).ok());
+                let (Some(clip), Some(corners)) = (clip, corners) else {
+                    return Done(Err("clip(貼り付けるクリップ ID)と corners(画面上の平面の四隅 [[左上x,左上y],[右上],[右下],[左下]]、画面中央が原点の画素)を指定してください".into()));
+                };
+                let from = params.get("time").cloned().and_then(|v| serde_json::from_value::<TimeArg>(v).ok()).map(|t| t.0).unwrap_or(self.playhead);
+                Done(self.start_plane_tracking(clip, corners.map(|c| (c[0], c[1])), from, true).map(|m| json!(format!("{m}。track_status で進み具合と結果を確認できます"))))
+            }
             "track_status" => Done(Ok(match &self.track_job {
                 Some(j) => json!({"tracking": true, "done": j.done.load(Ordering::Relaxed), "total": j.total.load(Ordering::Relaxed)}),
                 None => json!({"tracking": false, "last_result": self.last_track_result}),
@@ -540,6 +566,7 @@ impl Studio {
             cancel: Arc::new(AtomicBool::new(false)),
             result: Arc::new(Mutex::new(None)),
             from_mcp,
+            label: "トラッキング追従",
         };
         let (done, total, cancel, result) = (job.done.clone(), job.total.clone(), job.cancel.clone(), job.result.clone());
         std::thread::spawn(move || {
@@ -570,22 +597,69 @@ impl Studio {
         Ok(format!("クリップ {target} の追従を解析中(追跡元: クリップ {source})"))
     }
 
+    /// `target` を、その下の動画の平面(画面上の四隅 `screen`)に貼り付け、平面を追跡して動かす解析を始める。
+    fn start_plane_tracking(&mut self, target: Id, screen: [(f64, f64); 4], from: Time, from_mcp: bool) -> Result<String, String> {
+        if self.track_job.is_some() {
+            return Err("トラッキングの実行中です".into());
+        }
+        let p = self.editor.project.clone();
+        let tc = p.clip(target).ok_or("貼り付けるクリップがありません")?.clone();
+        if !tc.contains(from) {
+            return Err(format!("再生位置({from})が、貼り付けるクリップの表示範囲({}〜{})の外です", tc.start, tc.end()));
+        }
+        let source = studio_track::source_below(&p, target, from).ok_or("このクリップより下のトラックに、再生位置で表示されている動画がありません")?;
+        let mut quad = [(0.0f32, 0.0f32); 4];
+        for (q, s) in quad.iter_mut().zip(screen) {
+            *q = studio_track::screen_to_source(&p, source, from, s).ok_or("四隅のどれかが、下の動画の範囲の外です")?;
+        }
+        let job = TrackJob {
+            done: Arc::new(AtomicI64::new(0)),
+            total: Arc::new(AtomicI64::new(1)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            result: Arc::new(Mutex::new(None)),
+            from_mcp,
+            label: "平面トラッキング貼り付け",
+        };
+        let (done, total, cancel, result) = (job.done.clone(), job.total.clone(), job.cancel.clone(), job.result.clone());
+        std::thread::spawn(move || {
+            let r = (|| {
+                let tr = studio_track::track_plane(&p, source, from, tc.end(), quad, |d, t| {
+                    done.store(d as i64, Ordering::Relaxed);
+                    total.store(t as i64, Ordering::Relaxed);
+                    !cancel.load(Ordering::Relaxed)
+                })?;
+                let ok = tr.iter().filter(|k| k.corners.is_some()).count();
+                let lost = tr.iter().find(|k| k.corners.is_none()).map(|k| k.time);
+                let cmds = studio_track::pin_commands(&p, target, source, &tr)?;
+                let msg = match lost {
+                    Some(t) => format!("平面を {ok} フレーム追跡し、{t} で見失ったのでそこで止めました(以降は手で調整してください)"),
+                    None => format!("平面を {ok} フレーム追跡し、クリップ {target} を貼り付けました"),
+                };
+                Ok((cmds, msg))
+            })();
+            *result.lock().unwrap() = Some(r);
+        });
+        self.track_job = Some(job);
+        Ok(format!("クリップ {target} を貼る平面を解析中(追跡元: クリップ {source})"))
+    }
+
     /// 終わったトラッキングの結果を反映する。
     fn finish_tracking(&mut self) {
         let Some(job) = &self.track_job else { return };
         let Some(r) = job.result.lock().unwrap().take() else { return };
         let from_mcp = job.from_mcp;
+        let label = job.label;
         self.track_job = None;
         match r {
             Ok((cmds, msg)) => {
                 if from_mcp && self.mcp_mode == McpMode::Ask {
-                    let summary = self.editor.dry_run(&cmds).map(|o| vec![msg.clone(), format!("キーフレーム {} 個を設定", o.summary.len().saturating_sub(2))]).unwrap_or_else(|e| vec![e.to_string()]);
+                    let summary = self.editor.dry_run(&cmds).map(|o| [vec![msg.clone()], o.summary.into_iter().take(3).collect()].concat()).unwrap_or_else(|e| vec![e.to_string()]);
                     let (tx, _rx) = std::sync::mpsc::channel();
-                    self.pending.push_back(Pending { title: "トラッキングによる追従".into(), summary, action: PendingAction::Commands { label: "トラッキング追従".into(), commands: cmds }, reply: tx });
+                    self.pending.push_back(Pending { title: label.into(), summary, action: PendingAction::Commands { label: label.into(), commands: cmds }, reply: tx });
                     self.last_track_result = format!("{msg}(承認待ち)");
                 } else {
                     let origin = if from_mcp { Origin::Mcp } else { Origin::User };
-                    match self.editor.transaction("トラッキング追従", cmds, origin) {
+                    match self.editor.transaction(label, cmds, origin) {
                         Ok(_) => self.last_track_result = msg.clone(),
                         Err(e) => self.last_track_result = format!("追従を設定できません: {}", e.error.message),
                     }
@@ -1061,9 +1135,36 @@ impl Studio {
             let label = if picking { "クリックを待っています(取り消す)" } else { "点を追跡して追従させる" };
             if ui.add_enabled(self.track_job.is_none(), egui::Button::new(label)).on_hover_text("下のトラックの動画の上で追いたい点をプレビューでクリックすると、このクリップがその動きに合わせて動きます(再生位置からクリップの終わりまで)").clicked() {
                 self.pick_track = if picking { None } else { Some(id) };
+                self.pick_corners = None;
                 if !picking {
                     self.status = "プレビュー上で、追いかけたい点(模様のはっきりした所)をクリックしてください".into();
                 }
+            }
+            // 四隅の貼り付け(壁・机・画面などの平面に合わせて変形する)
+            let pins = self.editor.project.clip(id).map_or(0, |c| c.pin.len());
+            ui.horizontal_wrapped(|ui| {
+                for (mode, name, tip) in [
+                    (PinPick::Static, "四隅を指定して貼る", "プレビューで 左上→右上→右下→左下 の順にクリックした四角形に合わせて変形します"),
+                    (PinPick::Track, "平面を追跡して貼る", "下の動画の平面(壁・机など)の四隅を 左上→右上→右下→左下 の順にクリックすると、平面を追跡して貼り付けます(再生位置からクリップの終わりまで)"),
+                ] {
+                    let active = self.pick_corners.as_ref().is_some_and(|(c, m, _)| *c == id && *m == mode);
+                    let label = if active { "クリックを待っています(取り消す)" } else { name };
+                    if ui.add_enabled(self.track_job.is_none(), egui::Button::new(label)).on_hover_text(tip).clicked() {
+                        self.pick_corners = if active { None } else { Some((id, mode, vec![])) };
+                        self.pick_track = None;
+                        if !active {
+                            self.status = "プレビューで、四隅を 左上 → 右上 → 右下 → 左下 の順にクリックしてください".into();
+                        }
+                    }
+                }
+            });
+            if pins > 0 {
+                ui.horizontal(|ui| {
+                    ui.label(format!("四隅で変形中(キー {pins} 個)。位置・拡大・回転は使われません"));
+                    if ui.button("外す").clicked() {
+                        self.run("四隅を外す", vec![Command::SetPin { clip: id, keys: vec![] }]);
+                    }
+                });
             }
         }
         if ui.button("このクリップを削除").clicked() {
@@ -1122,6 +1223,58 @@ impl Studio {
                 let (area, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
                 let img = egui::Rect::from_center_size(area.center(), size);
                 ui.painter().image(tid, img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                let to_screen = |p: egui::Pos2| (((p.x - img.center().x) / scale) as f64, ((p.y - img.center().y) / scale) as f64);
+                let to_ui = |s: (f64, f64)| egui::pos2(img.center().x + s.0 as f32 * scale, img.center().y + s.1 as f32 * scale);
+                // 選択中のクリップの四隅を表示する
+                if let Some(c) = self.selected.and_then(|id| project.clip(id)).filter(|c| c.contains(self.playhead)) {
+                    if let Some(k) = studio_core::project::eval_pin(&c.pin, self.playhead - c.start) {
+                        let pts: Vec<egui::Pos2> = k.iter().map(|p| to_ui((p[0], p[1]))).collect();
+                        ui.painter().add(egui::Shape::closed_line(pts.clone(), egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 200, 255))));
+                        for p in pts {
+                            ui.painter().circle_filled(p, 3.5, egui::Color32::from_rgb(0, 200, 255));
+                        }
+                    }
+                }
+                if let Some((target, mode, pts)) = self.pick_corners.clone() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    ui.painter().rect_stroke(img, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 0)), egui::StrokeKind::Outside);
+                    let mut shown: Vec<egui::Pos2> = pts.iter().map(|s| to_ui(*s)).collect();
+                    if let Some(h) = resp.hover_pos().filter(|p| img.contains(*p)) {
+                        shown.push(h);
+                    }
+                    let col = egui::Color32::from_rgb(255, 200, 0);
+                    ui.painter().add(egui::Shape::line(shown.clone(), egui::Stroke::new(1.5, col)));
+                    if shown.len() == 4 {
+                        ui.painter().line_segment([shown[3], shown[0]], egui::Stroke::new(1.0, col));
+                    }
+                    for (i, p) in shown.iter().take(pts.len()).enumerate() {
+                        ui.painter().circle_filled(*p, 4.0, col);
+                        ui.painter().text(*p + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, ["左上", "右上", "右下", "左下"][i], egui::FontId::proportional(13.0), col);
+                    }
+                    if let Some(pos) = resp.clicked().then(|| resp.interact_pointer_pos()).flatten().filter(|p| img.contains(*p)) {
+                        let mut pts = pts;
+                        pts.push(to_screen(pos));
+                        if pts.len() < 4 {
+                            self.status = format!("次は{}をクリックしてください", ["左上", "右上", "右下", "左下"][pts.len()]);
+                            self.pick_corners = Some((target, mode, pts));
+                        } else {
+                            self.pick_corners = None;
+                            let corners = [pts[0], pts[1], pts[2], pts[3]];
+                            self.status = match mode {
+                                PinPick::Track => self.start_plane_tracking(target, corners, self.playhead, false).unwrap_or_else(|e| e),
+                                PinPick::Static => {
+                                    let local = project.clip(target).map_or(Time::ZERO, |c| (self.playhead - c.start).max(Time::ZERO).min(c.duration));
+                                    let keys = vec![studio_core::project::PinKey { time: local, corners: corners.map(|p| [p.0, p.1]) }];
+                                    if self.run("四隅に貼る", vec![Command::SetPin { clip: target, keys }]).is_some() {
+                                        "四隅に合わせて貼り付けました".into()
+                                    } else {
+                                        self.status.clone()
+                                    }
+                                }
+                            };
+                        }
+                    }
+                }
                 if let Some(target) = self.pick_track {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
                     ui.painter().rect_stroke(img, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 0)), egui::StrokeKind::Outside);

@@ -32,6 +32,32 @@ float4 psmain(VSOut i) : SV_Target {
     c.rgb *= c.a;                       // 乗算済みにして重ねる
     return c * opacity;
 }
+
+// 四隅の貼り付け: 画面全体を覆う三角形を描き、各画素から素材の座標を射影変換で逆算する
+cbuffer Pin : register(b1) {
+    float4 h0;   // 画面の画素 → 素材の uv(3x3 の各行、xyz を使う)
+    float4 h1;
+    float4 h2;
+    float pin_opacity;
+    float3 _pad2;
+};
+VSOut vs_full(uint id : SV_VertexID) {
+    VSOut o;
+    float2 p = float2(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0);
+    o.pos = float4(p, 0, 1);
+    o.uv = 0;
+    return o;
+}
+float4 ps_pin(VSOut i) : SV_Target {
+    float3 s = float3(i.pos.xy, 1);
+    float3 u = float3(dot(h0.xyz, s), dot(h1.xyz, s), dot(h2.xyz, s));
+    if (u.z <= 0) discard;
+    float2 uv = u.xy / u.z;
+    if (any(uv < 0) || any(uv > 1)) discard;
+    float4 c = tex.SampleLevel(smp, uv, 0);
+    c.rgb *= c.a;
+    return c * pin_opacity;
+}
 "#;
 
 pub fn compile(entry: &str, target: &str) -> Result<Vec<u8>, String> {
@@ -65,6 +91,9 @@ pub struct Gpu {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     cb: ID3D11Buffer,
+    vs_full: ID3D11VertexShader,
+    ps_pin: ID3D11PixelShader,
+    cb_pin: ID3D11Buffer,
     blend: ID3D11BlendState,
     sampler: ID3D11SamplerState,
     raster: ID3D11RasterizerState,
@@ -77,6 +106,40 @@ struct LayerCb {
     center: [f32; 2],
     opacity: f32,
     _pad: f32,
+}
+
+#[repr(C)]
+struct PinCb {
+    h: [[f32; 4]; 3],
+    opacity: f32,
+    _pad: [f32; 3],
+}
+
+type M3 = [[f64; 3]; 3];
+
+/// 単位正方形(u, v ∈ [0,1])を四角形 q(左上・右上・右下・左下)へ写す射影変換。
+pub fn square_to_quad(q: &[[f64; 2]; 4]) -> M3 {
+    let [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] = *q;
+    let (dx1, dx2, dx3) = (x1 - x2, x3 - x2, x0 - x1 + x2 - x3);
+    let (dy1, dy2, dy3) = (y1 - y2, y3 - y2, y0 - y1 + y2 - y3);
+    let det = dx1 * dy2 - dx2 * dy1;
+    let (g, h) = if det.abs() < 1e-12 || (dx3.abs() < 1e-12 && dy3.abs() < 1e-12) { (0.0, 0.0) } else { ((dx3 * dy2 - dx2 * dy3) / det, (dx1 * dy3 - dx3 * dy1) / det) };
+    [[x1 - x0 + g * x1, x3 - x0 + h * x3, x0], [y1 - y0 + g * y1, y3 - y0 + h * y3, y0], [g, h, 1.0]]
+}
+
+pub fn invert3(m: &M3) -> Option<M3> {
+    let c = |r: usize, k: usize| m[(r + 1) % 3][(k + 1) % 3] * m[(r + 2) % 3][(k + 2) % 3] - m[(r + 1) % 3][(k + 2) % 3] * m[(r + 2) % 3][(k + 1) % 3];
+    let det = m[0][0] * c(0, 0) + m[0][1] * c(0, 1) + m[0][2] * c(0, 2);
+    if det.abs() < 1e-15 {
+        return None;
+    }
+    let mut o = [[0.0; 3]; 3];
+    for r in 0..3 {
+        for k in 0..3 {
+            o[k][r] = c(r, k) / det;
+        }
+    }
+    Some(o)
 }
 
 /// 1 枚のレイヤーの置き方(ピクセル単位、画面中央が原点、y は下向き)。
@@ -114,10 +177,28 @@ impl Gpu {
         };
         let vsb = compile("vsmain", "vs_5_0")?;
         let psb = compile("psmain", "ps_5_0")?;
+        let vfb = compile("vs_full", "vs_5_0")?;
+        let ppb = compile("ps_pin", "ps_5_0")?;
         let (mut vs, mut ps, mut cb, mut blend, mut sampler, mut raster) = (None, None, None, None, None, None);
+        let (mut vs_full, mut ps_pin, mut cb_pin) = (None, None, None);
         unsafe {
             device.CreateVertexShader(&vsb, None, Some(&mut vs)).map_err(e("頂点シェーダ"))?;
             device.CreatePixelShader(&psb, None, Some(&mut ps)).map_err(e("ピクセルシェーダ"))?;
+            device.CreateVertexShader(&vfb, None, Some(&mut vs_full)).map_err(e("頂点シェーダ"))?;
+            device.CreatePixelShader(&ppb, None, Some(&mut ps_pin)).map_err(e("ピクセルシェーダ"))?;
+            device
+                .CreateBuffer(
+                    &D3D11_BUFFER_DESC {
+                        ByteWidth: std::mem::size_of::<PinCb>() as u32,
+                        Usage: D3D11_USAGE_DYNAMIC,
+                        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                        ..Default::default()
+                    },
+                    None,
+                    Some(&mut cb_pin),
+                )
+                .map_err(e("定数バッファ"))?;
             device
                 .CreateBuffer(
                     &D3D11_BUFFER_DESC {
@@ -160,7 +241,7 @@ impl Gpu {
                 .CreateRasterizerState(&D3D11_RASTERIZER_DESC { FillMode: D3D11_FILL_SOLID, CullMode: D3D11_CULL_NONE, DepthClipEnable: true.into(), ..Default::default() }, Some(&mut raster))
                 .map_err(e("ラスタライザ"))?;
         }
-        Ok(Self { device, ctx, vs: vs.unwrap(), ps: ps.unwrap(), cb: cb.unwrap(), blend: blend.unwrap(), sampler: sampler.unwrap(), raster: raster.unwrap() })
+        Ok(Self { device, ctx, vs: vs.unwrap(), ps: ps.unwrap(), cb: cb.unwrap(), vs_full: vs_full.unwrap(), ps_pin: ps_pin.unwrap(), cb_pin: cb_pin.unwrap(), blend: blend.unwrap(), sampler: sampler.unwrap(), raster: raster.unwrap() })
     }
 
     pub fn create_texture(&self, width: u32, height: u32, bgra: Option<&[u8]>, render_target: bool) -> Result<Texture, String> {
@@ -238,6 +319,43 @@ impl Gpu {
             ctx.PSSetShaderResources(0, Some(&[Some(src.srv.clone())]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.Draw(4, 0);
+            ctx.PSSetShaderResources(0, Some(&[None]));
+            ctx.OMSetRenderTargets(None, None);
+        }
+    }
+
+    /// レイヤーを四隅の位置(画面のピクセル、中央が原点、y は下向き。左上・右上・右下・左下)に合わせて描く。
+    pub fn draw_pinned(&self, rtv: &ID3D11RenderTargetView, target: (u32, u32), src: &Texture, corners: &[[f64; 2]; 4], opacity: f64) {
+        let (tw, th) = (target.0 as f64, target.1 as f64);
+        let q = corners.map(|p| [p[0] + tw / 2.0, p[1] + th / 2.0]);
+        let Some(mut inv) = invert3(&square_to_quad(&q)) else { return };
+        // 四角形の内側で w が正になる向きにそろえる
+        let (cx, cy) = (q.iter().map(|p| p[0]).sum::<f64>() / 4.0, q.iter().map(|p| p[1]).sum::<f64>() / 4.0);
+        if inv[2][0] * cx + inv[2][1] * cy + inv[2][2] < 0.0 {
+            inv = inv.map(|r| r.map(|v| -v));
+        }
+        let row = |r: [f64; 3]| [r[0] as f32, r[1] as f32, r[2] as f32, 0.0];
+        let cb = PinCb { h: [row(inv[0]), row(inv[1]), row(inv[2])], opacity: opacity as f32, _pad: [0.0; 3] };
+        unsafe {
+            let ctx = &self.ctx;
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            if ctx.Map(&self.cb_pin, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut m)).is_err() {
+                return;
+            }
+            std::ptr::copy_nonoverlapping(&cb as *const PinCb as *const u8, m.pData as *mut u8, std::mem::size_of::<PinCb>());
+            ctx.Unmap(&self.cb_pin, 0);
+            ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            ctx.OMSetBlendState(&self.blend, None, 0xffff_ffff);
+            ctx.RSSetState(&self.raster);
+            ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { Width: tw as f32, Height: th as f32, MaxDepth: 1.0, ..Default::default() }]));
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs_full, None);
+            ctx.PSSetShader(&self.ps_pin, None);
+            ctx.PSSetConstantBuffers(1, Some(&[Some(self.cb_pin.clone())]));
+            ctx.PSSetShaderResources(0, Some(&[Some(src.srv.clone())]));
+            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            ctx.Draw(3, 0);
             ctx.PSSetShaderResources(0, Some(&[None]));
             ctx.OMSetRenderTargets(None, None);
         }

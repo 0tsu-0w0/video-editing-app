@@ -49,6 +49,11 @@ fn tools() -> Value {
          "inputSchema": {"type": "object", "required": ["clip", "x", "y"], "properties": {
              "clip": {"type": "integer", "description": "追従させるクリップの ID"},
              "x": {"type": "number"}, "y": {"type": "number"}, "time": time}}},
+        {"name": "track_plane", "description": "クリップ(clip)を、その下のトラックの動画に写っている平面(壁・机・看板・画面など)に貼り付け、平面を追跡して遠近ごと動かす。corners は time の時点の画面上での平面の四隅(左上・右上・右下・左下の順、画面中央が原点の画素、y は下向き)。clip の素材の四隅がそこに合わさる。解析は裏で進むので track_status で結果を確認する。貼り付けだけなら execute_commands の set_pin を使う",
+         "inputSchema": {"type": "object", "required": ["clip", "corners"], "properties": {
+             "clip": {"type": "integer", "description": "貼り付けるクリップの ID"},
+             "corners": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}},
+             "time": time}}},
         {"name": "track_status", "description": "トラッキングの進み具合と、最後の結果", "inputSchema": {"type": "object", "properties": {}}},
     ])
 }
@@ -70,6 +75,7 @@ fn method_of(tool: &str) -> Option<&'static str> {
         "export_video" => "export",
         "export_status" => "export_status",
         "track_follow" => "track_follow",
+        "track_plane" => "track_plane",
         "track_status" => "track_status",
         _ => return None,
     })

@@ -41,6 +41,8 @@ pub fn command_schema() -> Value {
             {"command": "remove_key", "args": {"clip": "クリップ ID", "param": "params の name", "time": "キーの時刻(秒)"}},
             {"command": "set_fade", "description": "フェードイン・アウトの長さ(秒)。映像は不透明度、音声は音量に効く。0 で無し", "args": {
                 "clip": "クリップ ID", "fade_in": "(任意)秒", "fade_out": "(任意)秒"}},
+            {"command": "set_pin", "description": "クリップの素材の四隅を画面上の位置に合わせて変形する(壁や机などの平面に貼る)。keys が空なら外す。四隅がある間は x / y / scale / rotation は使われない", "args": {
+                "clip": "クリップ ID", "keys": "[{\"time\": クリップ開始からの秒, \"corners\": [[左上x,左上y],[右上x,右上y],[右下x,右下y],[左下x,左下y]]}, ...](位置は画面中央が原点のピクセル。キーの間は直線で補間)"}},
             {"command": "import_asset", "description": "文字の素材を作る(動画・画像のファイルは import_file ツールで読み込む)。作った素材は add_clip で映像トラックに置く", "args": {
                 "name": "素材名", "path": "\"\"(空文字)",
                 "kind": "{\"type\": \"text\", \"text\": \"表示する文字(改行は \n)\", \"style\": {\"font\":\"meiryo\",\"size\":72,\"color\":\"#FFFFFF\",\"outline\":6,\"outline_color\":\"#000000\",\"align\":\"center\"}}(style は任意)"}},
@@ -132,6 +134,15 @@ pub fn describe(p: &Project) -> Value {
                     }
                     if c.fade_out.0 > 0 {
                         extra.insert("fade_out".into(), json!(r3(c.fade_out)));
+                    }
+                    if !c.pin.is_empty() {
+                        // キーが多いとき(追跡結果)は、最初と最後と数だけ載せる
+                        let r = |v: f64| (v * 10.0).round() / 10.0;
+                        let k = |k: &crate::project::PinKey| json!({"time": r3(k.time), "corners": k.corners.iter().map(|p| [r(p[0]), r(p[1])]).collect::<Vec<_>>()});
+                        extra.insert(
+                            "pin".into(),
+                            if c.pin.len() <= 4 { json!(c.pin.iter().map(k).collect::<Vec<_>>()) } else { json!({"count": c.pin.len(), "first": k(&c.pin[0]), "last": k(c.pin.last().unwrap())}) },
+                        );
                     }
                     let mut v = json!({
                         "id": c.id.0, "asset": c.asset.0,
@@ -259,7 +270,7 @@ mod tests {
             serde_json::from_value::<Command>(ex.clone()).unwrap();
         }
         let names: Vec<&str> = s["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings"] {
+        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text"] {
             assert!(names.contains(&n), "{n} の説明がない");
         }
         assert!(!names.iter().any(|n| n.starts_with("restore")), "内部用コマンドを公開しない");

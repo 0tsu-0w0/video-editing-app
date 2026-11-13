@@ -117,6 +117,10 @@ impl Renderer {
                 Source::Image { tex } | Source::Text { tex, .. } => tex,
                 Source::Broken(_) => continue,
             };
+            if let Some(c) = &layer.corners {
+                gpu.draw_pinned(&rtv, (w, h), tex, c, layer.opacity);
+                continue;
+            }
             gpu.draw(
                 &rtv,
                 (w, h),

@@ -149,6 +149,13 @@ pub enum Command {
         align: Option<String>,
     },
 
+    /// 四隅の位置のキーフレームを置き換える(平面への貼り付け)。keys が空なら貼り付けを外す
+    SetPin {
+        clip: Id,
+        #[serde(default)]
+        keys: Vec<PinKey>,
+    },
+
     // ---- 値・キーフレーム
     /// 値を定数にする(キーフレームは消える)
     SetParam { clip: Id, param: String, value: f64 },
@@ -217,6 +224,7 @@ impl Command {
             Command::SplitClip { .. } => "split_clip",
             Command::SetFade { .. } => "set_fade",
             Command::SetText { .. } => "set_text",
+            Command::SetPin { .. } => "set_pin",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
             Command::RemoveKey { .. } => "remove_key",
@@ -436,7 +444,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 (None, None) => Time::from_secs_f64(5.0),
             };
             let id = take_id(p, id)?;
-            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO };
+            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![] };
             check_clip_time(p, &clip)?;
             insert_clip(track_mut(p, track)?, clip)?;
             done(
@@ -547,6 +555,16 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                     }
                 }
             }
+            if !c.pin.is_empty() {
+                let at_left = eval_pin(&c.pin, left).unwrap();
+                let lp = &mut t.clips[ci].pin;
+                right.pin = lp.iter().filter(|k| k.time > left).map(|k| PinKey { time: k.time - left, ..*k }).collect();
+                right.pin.insert(0, PinKey { time: Time::ZERO, corners: at_left });
+                lp.retain(|k| k.time <= left);
+                if lp.last().map_or(true, |k| k.time < left) {
+                    lp.push(PinKey { time: left, corners: at_left });
+                }
+            }
             insert_clip(t, right)?;
             done(
                 // 取り消し: 右側を消し、変更した左側を消して、分割前のクリップを丸ごと戻す
@@ -571,6 +589,20 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             t.clips[ci].fade_in = fi;
             t.clips[ci].fade_out = fo;
             done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, format!("クリップ {clip} のフェードをイン {fi}・アウト {fo} に設定"))
+        }
+        SetPin { clip, keys } => {
+            let (t, ci) = clip_mut(p, clip)?;
+            unlocked(t)?;
+            if t.kind != TrackKind::Video {
+                return err("invalid", "四隅の貼り付けは映像トラックのクリップだけです");
+            }
+            check_pin(&keys).map_err(|m| EditError { code: "invalid", message: m })?;
+            let tid = t.id;
+            let old = t.clips[ci].clone();
+            let n = keys.len();
+            t.clips[ci].pin = keys;
+            let s = if n == 0 { format!("クリップ {clip} の四隅の貼り付けを外す") } else { format!("クリップ {clip} の四隅をキー {n} 個で設定") };
+            done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)
         }
         SetText { asset, text, font, size, color, outline, outline_color, align } => {
             let a = p.assets.get_mut(&asset).ok_or(EditError { code: "not_found", message: format!("素材 {asset} はありません") })?;

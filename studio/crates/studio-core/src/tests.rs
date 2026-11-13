@@ -352,3 +352,47 @@ fn text_assets_and_set_text() {
     ed.project.check().unwrap();
     assert_eq!(Project::from_json(&ed.project.to_json()).unwrap(), ed.project);
 }
+
+#[test]
+fn corner_pin_interpolates_splits_and_undoes() {
+    let (mut ed, v1, _v2, a1, movie, img) = setup();
+    let c = ed.execute(AddClip { track: v1, asset: img, start: s(1.0), duration: Some(s(4.0)), source_in: None, id: None }, Origin::User).unwrap().created[0];
+    // AI からの JSON(秒で指定)
+    let cmds: Vec<Command> = serde_json::from_str(&format!(
+        r#"[{{"command": "set_pin", "clip": {}, "keys": [
+            {{"time": 0, "corners": [[-100,-100],[100,-100],[100,100],[-100,100]]}},
+            {{"time": 2, "corners": [[0,-100],[200,-100],[200,100],[0,100]]}}]}}]"#,
+        c.0
+    ))
+    .unwrap();
+    ed.transaction("四隅", cmds, Origin::Ai).unwrap();
+    let l = &layers_at(&ed.project, s(2.0))[0];
+    let k = l.corners.unwrap();
+    assert!((k[0][0] - -50.0).abs() < 1e-6 && (k[2][0] - 150.0).abs() < 1e-6, "{k:?}");
+    assert_eq!(layers_at(&ed.project, s(4.5))[0].corners.unwrap()[0], [0.0, -100.0]);
+    // 時刻が逆順・範囲外は拒否
+    let bad = PinKey { time: s(1.0), corners: [[0.0; 2]; 4] };
+    assert!(ed.execute(SetPin { clip: c, keys: vec![bad, PinKey { time: s(0.5), ..bad }] }, Origin::Ai).is_err());
+    assert!(ed.execute(SetPin { clip: c, keys: vec![PinKey { corners: [[1e9, 0.0]; 4], ..bad }] }, Origin::Ai).is_err());
+    // 音声トラックのクリップには置けない
+    let ac = ed.execute(AddClip { track: a1, asset: movie, start: s(0.0), duration: Some(s(1.0)), source_in: None, id: None }, Origin::User).unwrap().created[0];
+    assert!(ed.execute(SetPin { clip: ac, keys: vec![bad] }, Origin::User).is_err());
+    // 分割しても、画面上の四隅は変わらない
+    let before: Vec<_> = [1.5, 2.0, 2.5, 3.5].iter().map(|&t| layers_at(&ed.project, s(t))[0].corners).collect();
+    ed.execute(SplitClip { clip: c, at: s(2.0), new_id: None }, Origin::User).unwrap();
+    let after: Vec<_> = [1.5, 2.0, 2.5, 3.5].iter().map(|&t| layers_at(&ed.project, s(t))[0].corners).collect();
+    for (a, b) in before.iter().zip(&after) {
+        for (p, q) in a.unwrap().iter().zip(b.unwrap().iter()) {
+            assert!((p[0] - q[0]).abs() < 1e-6 && (p[1] - q[1]).abs() < 1e-6, "{a:?} {b:?}");
+        }
+    }
+    ed.project.check().unwrap();
+    // 保存・読み込みで保たれる
+    let p2 = Project::from_json(&ed.project.to_json()).unwrap();
+    assert_eq!(p2.clip(c).unwrap().pin.len(), ed.project.clip(c).unwrap().pin.len());
+    ed.undo();
+    ed.execute(SetPin { clip: c, keys: vec![] }, Origin::User).unwrap();
+    assert!(layers_at(&ed.project, s(2.0))[0].corners.is_none());
+    ed.undo();
+    assert!(layers_at(&ed.project, s(2.0))[0].corners.is_some());
+}

@@ -15,6 +15,8 @@ pub struct Layer {
     pub scale: f64,
     pub rotation: f64,
     pub opacity: f64,
+    /// 四隅の位置(あれば x / y / 拡大 / 回転の代わりに使う)
+    pub corners: Option<crate::project::Corners>,
 }
 
 /// 時刻 t に表示する映像レイヤー。
@@ -38,6 +40,7 @@ pub fn layers_at(p: &Project, t: Time) -> Vec<Layer> {
             scale: pr.scale.eval(local),
             rotation: pr.rotation.eval(local),
             opacity,
+            corners: crate::project::eval_pin(&c.pin, local),
         });
     }
     out

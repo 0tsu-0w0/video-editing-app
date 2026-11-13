@@ -125,6 +125,30 @@ fn track_and_follow_known_motion() {
     let x1 = c.params.x.eval(tr[59].time - c.start);
     assert!((x1 - (10.0 + 2.0 * VX as f64 * 59.0)).abs() < 2.0, "拡大時の x {x1}");
 
+    // 平面の追跡: 四角形の四隅が、模様と同じだけ動く
+    let quad = [(200.0, 100.0), (440.0, 110.0), (430.0, 260.0), (210.0, 250.0)];
+    let pl = track_plane(&p, src, s(0.5), s(2.5), quad, |_, _| true).unwrap();
+    assert_eq!(pl.len(), 60);
+    let mut max_err = 0.0f32;
+    for (k, key) in pl.iter().enumerate() {
+        let c = key.corners.unwrap_or_else(|| panic!("平面を {k} フレーム目で見失った"));
+        for (q, e) in c.iter().zip(quad) {
+            max_err = max_err.max(dist(*q, (e.0 + VX * k as f32, e.1 + VY * k as f32)));
+        }
+    }
+    eprintln!("平面の四隅の最大誤差 {max_err:.3}px");
+    assert!(max_err < 1.5, "平面の追跡の誤差が大きい: {max_err}");
+    let cmds = pin_commands(&p, target, src, &pl).unwrap();
+    let mut ed2 = Editor::new(p.clone());
+    ed2.transaction("貼り付け", cmds, Origin::User).unwrap();
+    let c = ed2.project.clip(target).unwrap();
+    assert_eq!(c.pin.len(), 60);
+    // 画面の中央が原点(素材 640x360 を等倍で中央に表示)
+    assert!((c.pin[0].corners[0][0] - (200.0 - 320.0)).abs() < 0.5 && (c.pin[0].corners[0][1] - (100.0 - 180.0)).abs() < 0.5, "{:?}", c.pin[0]);
+    // 模様の無い所は追跡できない
+    assert!(track_plane(&p, src, s(0.5), s(1.0), [(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)], |_, _| true).is_err());
+    assert!(pin_commands(&p, src, src, &pl).is_err());
+
     // 間違った使い方
     assert!(follow_commands(&p, src, src, &tr).is_err());
     assert!(track_point(&p, target, s(0.5), s(1.0), (1.0, 1.0), |_, _| true).is_err());

@@ -193,3 +193,49 @@ fn render_mix_and_export() {
     assert!(r2.is_err());
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn corner_pin_draws_perspective_quad() {
+    let gpu = Gpu::new(None).unwrap();
+    // 左半分が赤、右半分が緑の 64x64
+    let mut px = vec![0u8; 64 * 64 * 4];
+    for y in 0..64 {
+        for x in 0..64 {
+            let i = (y * 64 + x) * 4;
+            px[i..i + 4].copy_from_slice(if x < 32 { &[0, 0, 255, 255] } else { &[0, 255, 0, 255] });
+        }
+    }
+    let src = gpu.create_texture(64, 64, Some(&px), false).unwrap();
+    let dst = gpu.create_texture(400, 400, None, true).unwrap();
+    let rtv = gpu.rtv(&dst).unwrap();
+    gpu.clear(&rtv, [0.0, 0.0, 0.0, 1.0]);
+    // 台形(上が狭い): 画面中央原点
+    let q = [[-50.0, -100.0], [50.0, -100.0], [150.0, 100.0], [-150.0, 100.0]];
+    gpu.draw_pinned(&rtv, (400, 400), &src, &q, 1.0);
+    let out = gpu.read(&dst).unwrap();
+    let at = |x: f64, y: f64| {
+        let (px, py) = ((x + 200.0) as usize, (y + 200.0) as usize);
+        let i = (py * 400 + px) * 4;
+        [out[i], out[i + 1], out[i + 2]]
+    };
+    assert_eq!(at(-100.0, 90.0), [0, 0, 255], "左下は赤");
+    assert_eq!(at(100.0, 90.0), [0, 255, 0], "右下は緑");
+    assert_eq!(at(-40.0, -95.0), [0, 0, 255]);
+    assert_eq!(at(-120.0, -50.0), [0, 0, 0], "台形の外は描かない");
+    assert_eq!(at(0.0, 150.0), [0, 0, 0]);
+    // 中央の縦線は、射影変換では直線のまま(x = 0)
+    assert_eq!(at(-3.0, 0.0), [0, 0, 255]);
+    assert_eq!(at(3.0, 0.0), [0, 255, 0]);
+    // 遠近: 上下の中点(y=0)は、素材の中央(v=0.5)より上の部分を表す。上が狭い = 奥なので、
+    // 素材の上半分は画面で小さく見える。素材の横線 v=0.5 は y=0 より上(負)に来る
+    let h = super::gpu::square_to_quad(&q);
+    let map = |u: f64, v: f64| {
+        let w = h[2][0] * u + h[2][1] * v + h[2][2];
+        ((h[0][0] * u + h[0][1] * v + h[0][2]) / w, (h[1][0] * u + h[1][1] * v + h[1][2]) / w)
+    };
+    for (i, (u, v)) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].into_iter().enumerate() {
+        let p = map(u, v);
+        assert!((p.0 - q[i][0]).abs() < 1e-9 && (p.1 - q[i][1]).abs() < 1e-9);
+    }
+    assert!(map(0.5, 0.5).1 < 0.0);
+}

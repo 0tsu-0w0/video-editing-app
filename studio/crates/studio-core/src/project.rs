@@ -304,6 +304,62 @@ pub struct Clip {
     pub fade_in: Time,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fade_out: Time,
+    /// 四隅の位置のキーフレーム(平面への貼り付け)。空でなければ、x / y / 拡大 / 回転の代わりにこれで置く
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pin: Vec<PinKey>,
+}
+
+/// 四隅の位置(画面のピクセル、中央が原点、y は下向き)。素材の 左上・右上・右下・左下 の順。
+pub type Corners = [[f64; 2]; 4];
+
+/// 四隅のキーフレーム。キーの間は直線で補間する。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinKey {
+    /// クリップの開始からの時刻(秒)
+    #[serde(with = "crate::command::secs")]
+    pub time: Time,
+    pub corners: Corners,
+}
+
+/// 四隅のキーフレームの、クリップ内の時刻 t での値(キーが無ければ None)。
+pub fn eval_pin(keys: &[PinKey], t: Time) -> Option<Corners> {
+    let first = keys.first()?;
+    if t <= first.time {
+        return Some(first.corners);
+    }
+    let last = keys.last().unwrap();
+    if t >= last.time {
+        return Some(last.corners);
+    }
+    let i = keys.partition_point(|k| k.time <= t) - 1;
+    let (a, b) = (&keys[i], &keys[i + 1]);
+    let f = (t - a.time).0 as f64 / (b.time - a.time).0 as f64;
+    let mut c = a.corners;
+    for (p, q) in c.iter_mut().zip(b.corners.iter()) {
+        p[0] += (q[0] - p[0]) * f;
+        p[1] += (q[1] - p[1]) * f;
+    }
+    Some(c)
+}
+
+/// 四隅のキーフレームが正しいか(時刻の並び・数値の範囲)。
+pub fn check_pin(keys: &[PinKey]) -> Result<(), String> {
+    if keys.len() > 1_000_000 {
+        return Err("四隅のキーフレームが多すぎます".into());
+    }
+    for (i, k) in keys.iter().enumerate() {
+        if k.time < Time::ZERO {
+            return Err(format!("四隅のキー {i} の時刻が負です"));
+        }
+        if i > 0 && keys[i - 1].time >= k.time {
+            return Err(format!("四隅のキー {i} の時刻が、前のキーより後になっていません"));
+        }
+        if k.corners.iter().flatten().any(|v| !v.is_finite() || v.abs() > 100_000.0) {
+            return Err(format!("四隅のキー {i} の位置が範囲外です(±100000 ピクセルまで)"));
+        }
+    }
+    Ok(())
 }
 
 fn is_zero(t: &Time) -> bool {
@@ -413,6 +469,7 @@ impl Project {
                     return Err(format!("クリップ {} の ID が不正です", c.id));
                 }
                 let a = self.assets.get(&c.asset).ok_or(format!("クリップ {} の素材がありません", c.id))?;
+                check_pin(&c.pin).map_err(|e| format!("クリップ {}: {e}", c.id))?;
                 if c.fade_in < Time::ZERO || c.fade_out < Time::ZERO || c.fade_in + c.fade_out > c.duration {
                     return Err(format!("クリップ {} のフェードが長さを超えています", c.id));
                 }
