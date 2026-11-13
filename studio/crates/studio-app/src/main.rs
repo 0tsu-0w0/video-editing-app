@@ -1103,13 +1103,81 @@ impl Studio {
                 }
             }
         });
+        let on_video_track = self.editor.project.find_clip(id).is_some_and(|(ti, _)| self.editor.project.tracks[ti].kind == TrackKind::Video);
+        if on_video_track {
+            // トランジション(始まり・終わり)
+            use studio_core::command::Edge;
+            use studio_core::project::{Transition, TRANSITION_KINDS};
+            let mut tcmd = None;
+            for (edge, label, cur) in [(Edge::In, "始まり", clip.transition_in), (Edge::Out, "終わり", clip.transition_out)] {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let name = cur.and_then(|t| TRANSITION_KINDS.iter().find(|k| k.0 == t.kind)).map_or("なし", |k| k.2);
+                    let mut pick = cur.map(|t| t.kind);
+                    egui::ComboBox::from_id_salt(("tr", id, label)).selected_text(name).width(170.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut pick, None, "なし");
+                        for (k, _, n) in TRANSITION_KINDS {
+                            ui.selectable_value(&mut pick, Some(k), n);
+                        }
+                    });
+                    let mut secs = cur.map_or(0.5, |t| t.duration.secs_f64());
+                    let other = if edge == Edge::In { clip.transition_out } else { clip.transition_in }.map_or(0.0, |t| t.duration.secs_f64());
+                    let max = (clip.duration.secs_f64() - other).max(0.01);
+                    let dur_changed = cur.is_some() && ui.add(egui::DragValue::new(&mut secs).range(0.01..=max).speed(0.02).suffix(" 秒").fixed_decimals(2)).changed();
+                    if pick != cur.map(|t| t.kind) || dur_changed {
+                        let transition = pick.map(|kind| Transition { kind, duration: Time::from_secs_f64(secs.min(max)) });
+                        tcmd = Some((format!("tr:{id}:{label}"), Command::SetTransition { clip: id, edge, transition }));
+                    }
+                });
+            }
+            if let Some((key, c)) = tcmd {
+                if let Err(e) = self.editor.transaction_merged("トランジション", vec![c], Origin::User, &key, std::time::Duration::from_secs(2)) {
+                    self.status = format!("できませんでした: {}", e.error.message);
+                }
+            }
+            // マスク
+            use studio_core::project::{Mask, MaskShape};
+            ui.horizontal(|ui| {
+                ui.label("マスク");
+                let mut shape = clip.mask.map(|m| m.shape);
+                let mut invert = clip.mask.is_some_and(|m| m.invert);
+                let before = (shape, invert);
+                ui.selectable_value(&mut shape, None, "なし");
+                ui.selectable_value(&mut shape, Some(MaskShape::Rect), "四角");
+                ui.selectable_value(&mut shape, Some(MaskShape::Ellipse), "楕円");
+                if shape.is_some() {
+                    ui.checkbox(&mut invert, "反転");
+                }
+                if (shape, invert) != before {
+                    self.run("マスク", vec![Command::SetMask { clip: id, mask: shape.map(|shape| Mask { shape, invert }) }]);
+                }
+            });
+        }
         ui.separator();
         let local = (self.playhead - clip.start).max(Time::ZERO).min(clip.duration);
-        let labels = [("x", "X 位置"), ("y", "Y 位置"), ("scale", "拡大率"), ("rotation", "回転"), ("rot_y", "3D 横の向き"), ("rot_x", "3D 縦の傾き"), ("opacity", "不透明度"), ("volume", "音量"), ("pan", "パン")];
+        let labels = [
+            ("x", "X 位置"),
+            ("y", "Y 位置"),
+            ("scale", "拡大率"),
+            ("rotation", "回転"),
+            ("rot_y", "3D 横の向き"),
+            ("rot_x", "3D 縦の傾き"),
+            ("opacity", "不透明度"),
+            ("mask_x", "マスク X"),
+            ("mask_y", "マスク Y"),
+            ("mask_w", "マスク幅"),
+            ("mask_h", "マスク高さ"),
+            ("mask_feather", "マスクのぼかし"),
+            ("volume", "音量"),
+            ("pan", "パン"),
+        ];
+        // 表示中のクリップは編集後の値で判断する(マスクを付けた直後に欄を出す)
+        let has_mask = self.editor.project.clip(id).is_some_and(|c| c.mask.is_some());
+        let clip = self.editor.project.clip(id).cloned().unwrap_or(clip);
         let is_model = matches!(self.editor.project.assets.get(&clip.asset).map(|a| &a.kind), Some(AssetKind::Model { .. }));
         let mut commit: Option<Command> = None;
         for (name, label) in labels {
-            if matches!(name, "rot_x" | "rot_y") && !is_model {
+            if matches!(name, "rot_x" | "rot_y") && !is_model || name.starts_with("mask_") && !has_mask {
                 continue;
             }
             let param = clip.params.get(name).unwrap();
@@ -1118,6 +1186,9 @@ impl Studio {
                 "x" | "y" => -4000.0..=4000.0,
                 "scale" => 0.0..=8.0,
                 "rotation" | "rot_x" | "rot_y" => -360.0..=360.0,
+                "mask_x" | "mask_y" => -4000.0..=4000.0,
+                "mask_w" | "mask_h" => 0.0..=8000.0,
+                "mask_feather" => 0.0..=400.0,
                 "volume" => 0.0..=4.0,
                 _ => lo..=hi,
             };

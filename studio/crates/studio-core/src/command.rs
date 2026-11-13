@@ -174,6 +174,20 @@ pub enum Command {
         keys: Vec<PinKey>,
     },
 
+    /// マスクを付ける・変える(mask が無ければ外す)。初めて付けるときは、素材の中央に半分の大きさで置く
+    SetMask {
+        clip: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<Mask>,
+    },
+    /// トランジションを付ける・外す(edge: "in" は始まり、"out" は終わり。transition が無ければ外す)
+    SetTransition {
+        clip: Id,
+        edge: Edge,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transition: Option<Transition>,
+    },
+
     // ---- 値・キーフレーム
     /// 値を定数にする(キーフレームは消える)
     SetParam { clip: Id, param: String, value: f64 },
@@ -246,6 +260,8 @@ impl Command {
             Command::SetFade { .. } => "set_fade",
             Command::SetText { .. } => "set_text",
             Command::SetPin { .. } => "set_pin",
+            Command::SetMask { .. } => "set_mask",
+            Command::SetTransition { .. } => "set_transition",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
             Command::RemoveKey { .. } => "remove_key",
@@ -256,6 +272,14 @@ impl Command {
             Command::RestoreParam { .. } => "restore_param",
         }
     }
+}
+
+/// クリップの端(始まり・終わり)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Edge {
+    In,
+    Out,
 }
 
 /// 失敗の理由。AI へそのまま返して修正させられるよう、具体的に書く。
@@ -470,7 +494,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 (None, None) => Time::from_secs_f64(5.0),
             };
             let id = take_id(p, id)?;
-            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![] };
+            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None };
             check_clip_time(p, &clip)?;
             insert_clip(track_mut(p, track)?, clip)?;
             done(
@@ -540,6 +564,14 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             // フェードが長さに収まらなければ縮める
             c.fade_in = c.fade_in.min(c.duration);
             c.fade_out = c.fade_out.min(c.duration - c.fade_in);
+            // 収まらないトランジションは外す
+            if c.transition_in.is_some_and(|t| t.duration > c.duration) {
+                c.transition_in = None;
+            }
+            let ti = c.transition_in.map_or(Time::ZERO, |t| t.duration);
+            if c.transition_out.is_some_and(|t| ti + t.duration > c.duration) {
+                c.transition_out = None;
+            }
             let r = check_clip_time(p, &c).and_then(|_| insert_clip(track_mut(p, tid)?, c.clone()));
             if let Err(e) = r {
                 insert_clip(track_mut(p, tid)?, old).expect("元に戻せない");
@@ -567,6 +599,14 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             // 右側のキーフレームは、新しいクリップの開始基準に付け直す
             let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: c.source_in + left, fade_in: Time::ZERO, ..c.clone() };
             right.fade_out = right.fade_out.min(right.duration);
+            right.transition_in = None;
+            if right.transition_out.is_some_and(|t| t.duration > right.duration) {
+                right.transition_out = None;
+            }
+            t.clips[ci].transition_out = None;
+            if t.clips[ci].transition_in.is_some_and(|t| t.duration > left) {
+                t.clips[ci].transition_in = None;
+            }
             t.clips[ci].fade_out = Time::ZERO;
             t.clips[ci].fade_in = t.clips[ci].fade_in.min(left);
             for (name, _, _) in PARAMS {
@@ -615,6 +655,69 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             t.clips[ci].fade_in = fi;
             t.clips[ci].fade_out = fo;
             done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, format!("クリップ {clip} のフェードをイン {fi}・アウト {fo} に設定"))
+        }
+        SetMask { clip, mask } => {
+            let size = {
+                let c = p.clip(clip).ok_or(EditError { code: "not_found", message: format!("クリップ {clip} はありません") })?;
+                match p.assets.get(&c.asset).map(|a| &a.kind) {
+                    Some(AssetKind::Video { width, height, .. }) | Some(AssetKind::Image { width, height }) => Some((*width as f64, *height as f64)),
+                    _ => None,
+                }
+            };
+            let fallback = (p.settings.width as f64, p.settings.height as f64);
+            let (t, ci) = clip_mut(p, clip)?;
+            unlocked(t)?;
+            if t.kind != TrackKind::Video {
+                return err("invalid", "マスクは映像トラックのクリップだけです");
+            }
+            let tid = t.id;
+            let old = t.clips[ci].clone();
+            let c = &mut t.clips[ci];
+            // 初めて付けるときは、大きさが 0 なら素材の半分にする
+            if mask.is_some() && c.params.mask_w.value == 0.0 && c.params.mask_w.keys.is_empty() && c.params.mask_h.keys.is_empty() {
+                let (w, h) = size.unwrap_or(fallback);
+                c.params.mask_w = Param::constant((w / 2.0).round());
+                c.params.mask_h = Param::constant((h / 2.0).round());
+            }
+            c.mask = mask;
+            let s = match mask {
+                Some(m) => format!("クリップ {clip} に{}のマスク{}", if m.shape == MaskShape::Rect { "四角" } else { "楕円" }, if m.invert { "(反転)" } else { "" }),
+                None => format!("クリップ {clip} のマスクを外す"),
+            };
+            done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)
+        }
+        SetTransition { clip, edge, transition } => {
+            let (t, ci) = clip_mut(p, clip)?;
+            unlocked(t)?;
+            if t.kind != TrackKind::Video {
+                return err("invalid", "トランジションは映像トラックのクリップだけです(音声はフェードを使ってください)");
+            }
+            let tid = t.id;
+            let old = t.clips[ci].clone();
+            let c = &mut t.clips[ci];
+            if let Some(tr) = transition {
+                if tr.duration <= Time::ZERO {
+                    return err("invalid", "トランジションの長さは 0 より大きくしてください");
+                }
+                let other = match edge {
+                    Edge::In => c.transition_out,
+                    Edge::Out => c.transition_in,
+                }
+                .map_or(Time::ZERO, |t| t.duration);
+                if tr.duration + other > c.duration {
+                    return err("out_of_range", format!("トランジションの長さ {} が、クリップの長さ {} に収まりません(反対側のトランジション {other} を含む)", tr.duration, c.duration));
+                }
+            }
+            match edge {
+                Edge::In => c.transition_in = transition,
+                Edge::Out => c.transition_out = transition,
+            }
+            let side = if edge == Edge::In { "始まり" } else { "終わり" };
+            let s = match transition {
+                Some(tr) => format!("クリップ {clip} の{side}に {:?} のトランジション({})", tr.kind, tr.duration),
+                None => format!("クリップ {clip} の{side}のトランジションを外す"),
+            };
+            done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)
         }
         SetPin { clip, keys } => {
             let (t, ci) = clip_mut(p, clip)?;

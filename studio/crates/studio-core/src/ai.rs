@@ -42,6 +42,11 @@ pub fn command_schema() -> Value {
             {"command": "remove_key", "args": {"clip": "クリップ ID", "param": "params の name", "time": "キーの時刻(秒)"}},
             {"command": "set_fade", "description": "フェードイン・アウトの長さ(秒)。映像は不透明度、音声は音量に効く。0 で無し", "args": {
                 "clip": "クリップ ID", "fade_in": "(任意)秒", "fade_out": "(任意)秒"}},
+            {"command": "set_transition", "description": "クリップの始まり(edge: \"in\")か終わり(\"out\")にトランジションを付ける。transition を省略すると外す。始まりのトランジションの間は、同じトラックですぐ前に接しているクリップが下に表示され続けるので、fade ならクロスフェード、wipe なら前の映像を拭うように切り替わる", "args": {
+                "clip": "クリップ ID", "edge": "\"in\" / \"out\"",
+                "transition": format!("(任意){{\"kind\": 種類, \"duration\": 秒}}。種類: {}", crate::project::TRANSITION_KINDS.iter().map(|k| format!("{}({})", k.1, k.2)).collect::<Vec<_>>().join(" / "))}},
+            {"command": "set_mask", "description": "クリップにマスクを付ける(形の内側だけ表示。invert で外側だけ)。mask を省略すると外す。位置と大きさは params の mask_x / mask_y(素材の中央からのピクセル)・mask_w / mask_h(幅・高さ)・mask_feather(ぼかし)で、キーフレームも置ける。初めて付けると素材の半分の大きさになる", "args": {
+                "clip": "クリップ ID", "mask": "(任意){\"shape\": \"rect\" または \"ellipse\", \"invert\": false}"}},
             {"command": "set_pin", "description": "クリップの素材の四隅を画面上の位置に合わせて変形する(壁や机などの平面に貼る)。keys が空なら外す。四隅がある間は x / y / scale / rotation は使われない", "args": {
                 "clip": "クリップ ID", "keys": "[{\"time\": クリップ開始からの秒, \"corners\": [[左上x,左上y],[右上x,右上y],[右下x,右下y],[左下x,左下y]]}, ...](位置は画面中央が原点のピクセル。キーの間は直線で補間)"}},
             {"command": "set_track_audio", "description": "音声トラックのミキサー: 音量(dB)・左右のバランス・ソロ(省略した項目はそのまま)", "args": {
@@ -66,6 +71,9 @@ pub fn command_schema() -> Value {
             {"command": "set_key", "clip": 9, "param": "opacity", "time": 0.5, "value": 1},
             {"command": "import_asset", "name": "タイトル", "path": "", "kind": {"type": "text", "text": "サンプル", "style": {"size": 96, "outline": 6}}},
             {"command": "set_fade", "clip": 9, "fade_in": 0.5, "fade_out": 0.5},
+            {"command": "set_transition", "clip": 9, "edge": "in", "transition": {"kind": "fade", "duration": 1.0}},
+            {"command": "set_mask", "clip": 9, "mask": {"shape": "ellipse"}},
+            {"command": "set_param", "clip": 9, "param": "mask_feather", "value": 40},
         ],
     })
 }
@@ -127,6 +135,7 @@ pub fn describe(p: &Project) -> Value {
                         let pr = c.params.get(name).unwrap();
                         let relevant = match t.kind {
                             TrackKind::Video if matches!(name, "rot_x" | "rot_y") => is_model,
+                            TrackKind::Video if name.starts_with("mask_") => c.mask.is_some(),
                             TrackKind::Video => !matches!(name, "volume" | "pan"),
                             TrackKind::Audio => matches!(name, "volume" | "pan"),
                         };
@@ -148,6 +157,15 @@ pub fn describe(p: &Project) -> Value {
                     }
                     if c.fade_out.0 > 0 {
                         extra.insert("fade_out".into(), json!(r3(c.fade_out)));
+                    }
+                    if let Some(m) = &c.mask {
+                        extra.insert("mask".into(), json!(m));
+                    }
+                    if let Some(t) = &c.transition_in {
+                        extra.insert("transition_in".into(), json!(t));
+                    }
+                    if let Some(t) = &c.transition_out {
+                        extra.insert("transition_out".into(), json!(t));
                     }
                     if !c.pin.is_empty() {
                         // キーが多いとき(追跡結果)は、最初と最後と数だけ載せる
@@ -288,7 +306,7 @@ mod tests {
             serde_json::from_value::<Command>(ex.clone()).unwrap();
         }
         let names: Vec<&str> = s["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain"] {
+        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask"] {
             assert!(names.contains(&n), "{n} の説明がない");
         }
         assert!(!names.iter().any(|n| n.starts_with("restore")), "内部用コマンドを公開しない");

@@ -305,6 +305,17 @@ pub struct ClipParams {
     pub rot_x: Param,
     #[serde(default = "zero_param")]
     pub rot_y: Param,
+    /// マスクの中心(素材の中央からのピクセル)・大きさ(幅・高さ、ピクセル)・ぼかし(ピクセル)
+    #[serde(default = "zero_param")]
+    pub mask_x: Param,
+    #[serde(default = "zero_param")]
+    pub mask_y: Param,
+    #[serde(default = "zero_param")]
+    pub mask_w: Param,
+    #[serde(default = "zero_param")]
+    pub mask_h: Param,
+    #[serde(default = "zero_param")]
+    pub mask_feather: Param,
 }
 
 fn zero_param() -> Param {
@@ -323,12 +334,17 @@ impl Default for ClipParams {
             pan: Param::constant(0.0),
             rot_x: Param::constant(0.0),
             rot_y: Param::constant(0.0),
+            mask_x: Param::constant(0.0),
+            mask_y: Param::constant(0.0),
+            mask_w: Param::constant(0.0),
+            mask_h: Param::constant(0.0),
+            mask_feather: Param::constant(0.0),
         }
     }
 }
 
 /// 項目名と、値の範囲。
-pub const PARAMS: [(&str, f64, f64); 9] = [
+pub const PARAMS: [(&str, f64, f64); 14] = [
     ("x", -100_000.0, 100_000.0),
     ("y", -100_000.0, 100_000.0),
     ("scale", 0.0, 100.0),
@@ -338,6 +354,11 @@ pub const PARAMS: [(&str, f64, f64); 9] = [
     ("pan", -1.0, 1.0),
     ("rot_x", -36_000.0, 36_000.0),
     ("rot_y", -36_000.0, 36_000.0),
+    ("mask_x", -100_000.0, 100_000.0),
+    ("mask_y", -100_000.0, 100_000.0),
+    ("mask_w", 0.0, 100_000.0),
+    ("mask_h", 0.0, 100_000.0),
+    ("mask_feather", 0.0, 2_000.0),
 ];
 
 impl ClipParams {
@@ -352,6 +373,11 @@ impl ClipParams {
             "pan" => &self.pan,
             "rot_x" => &self.rot_x,
             "rot_y" => &self.rot_y,
+            "mask_x" => &self.mask_x,
+            "mask_y" => &self.mask_y,
+            "mask_w" => &self.mask_w,
+            "mask_h" => &self.mask_h,
+            "mask_feather" => &self.mask_feather,
             _ => return None,
         })
     }
@@ -366,6 +392,11 @@ impl ClipParams {
             "pan" => &mut self.pan,
             "rot_x" => &mut self.rot_x,
             "rot_y" => &mut self.rot_y,
+            "mask_x" => &mut self.mask_x,
+            "mask_y" => &mut self.mask_y,
+            "mask_w" => &mut self.mask_w,
+            "mask_h" => &mut self.mask_h,
+            "mask_feather" => &mut self.mask_feather,
             _ => return None,
         })
     }
@@ -392,6 +423,76 @@ pub struct Clip {
     /// 四隅の位置のキーフレーム(平面への貼り付け)。空でなければ、x / y / 拡大 / 回転の代わりにこれで置く
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pin: Vec<PinKey>,
+    /// マスク(形の位置・大きさは params の mask_*)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<Mask>,
+    /// 始まり・終わりのトランジション
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_in: Option<Transition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_out: Option<Transition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskShape {
+    Rect,
+    Ellipse,
+}
+
+/// クリップのマスク。形の内側だけを表示する(invert なら外側だけ)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mask {
+    pub shape: MaskShape,
+    #[serde(default)]
+    pub invert: bool,
+}
+
+/// トランジションの種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionKind {
+    /// 透明度で溶け合う(前のクリップとはクロスフェード)
+    Fade,
+    /// 左から右へ拭うように現れる(消えるときは逆)
+    WipeRight,
+    WipeLeft,
+    WipeDown,
+    WipeUp,
+    /// 中央から円が広がる
+    Circle,
+    /// 右から入ってきて左へ抜ける
+    SlideLeft,
+    SlideRight,
+    /// 下から入ってきて上へ抜ける
+    SlideUp,
+    SlideDown,
+    /// 拡大しながら現れ、縮みながら消える
+    Zoom,
+}
+
+pub const TRANSITION_KINDS: [(TransitionKind, &str, &str); 11] = [
+    (TransitionKind::Fade, "fade", "フェード(前のクリップとクロスフェード)"),
+    (TransitionKind::WipeRight, "wipe_right", "ワイプ(左→右)"),
+    (TransitionKind::WipeLeft, "wipe_left", "ワイプ(右→左)"),
+    (TransitionKind::WipeDown, "wipe_down", "ワイプ(上→下)"),
+    (TransitionKind::WipeUp, "wipe_up", "ワイプ(下→上)"),
+    (TransitionKind::Circle, "circle", "円形"),
+    (TransitionKind::SlideLeft, "slide_left", "スライド(右から左へ)"),
+    (TransitionKind::SlideRight, "slide_right", "スライド(左から右へ)"),
+    (TransitionKind::SlideUp, "slide_up", "スライド(下から上へ)"),
+    (TransitionKind::SlideDown, "slide_down", "スライド(上から下へ)"),
+    (TransitionKind::Zoom, "zoom", "ズーム"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    /// 長さ(秒)
+    #[serde(with = "crate::command::secs")]
+    pub duration: Time,
 }
 
 /// 四隅の位置(画面のピクセル、中央が原点、y は下向き)。素材の 左上・右上・右下・左下 の順。
@@ -561,6 +662,10 @@ impl Project {
                 }
                 let a = self.assets.get(&c.asset).ok_or(format!("クリップ {} の素材がありません", c.id))?;
                 check_pin(&c.pin).map_err(|e| format!("クリップ {}: {e}", c.id))?;
+                let td = |t: &Option<Transition>| t.map_or(Time::ZERO, |t| t.duration);
+                if c.transition_in.is_some_and(|t| t.duration <= Time::ZERO) || c.transition_out.is_some_and(|t| t.duration <= Time::ZERO) || td(&c.transition_in) + td(&c.transition_out) > c.duration {
+                    return Err(format!("クリップ {} のトランジションの長さが不正です", c.id));
+                }
                 if c.fade_in < Time::ZERO || c.fade_out < Time::ZERO || c.fade_in + c.fade_out > c.duration {
                     return Err(format!("クリップ {} のフェードが長さを超えています", c.id));
                 }

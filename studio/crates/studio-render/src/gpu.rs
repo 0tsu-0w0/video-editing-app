@@ -18,6 +18,44 @@ cbuffer Layer : register(b0) {
 };
 Texture2D tex : register(t0);
 SamplerState smp : register(s0);
+// マスクとワイプ(素材のピクセルで計算する)
+cbuffer Mask : register(b2) {
+    float4 m_rect;   // 中心 x, y(左上原点のピクセル)、半分の幅・高さ
+    float4 m_opt;    // 形(0 無し, 1 四角, 2 楕円)、反転、ぼかし、_
+    float4 m_wipe;   // 種類(0 無し, 1 左→右, 2 右→左, 3 上→下, 4 下→上, 5 円)、見えている割合、_、_
+    float4 m_size;   // 素材の幅・高さ
+};
+float coverage(float e, float feather) {
+    return feather > 0.5 ? saturate(e / feather + 0.5) : (e >= 0 ? 1.0 : 0.0);
+}
+float mask_at(float2 uv) {
+    float m = 1;
+    float2 px = uv * m_size.xy;
+    if (m_opt.x > 0.5) {
+        float2 d = abs(px - m_rect.xy);
+        float2 hs = max(m_rect.zw, 1e-3);
+        float e;
+        if (m_opt.x < 1.5) {
+            e = min(hs.x - d.x, hs.y - d.y);
+        } else {
+            e = (1 - length(d / hs)) * min(hs.x, hs.y);
+        }
+        m = coverage(e, m_opt.z);
+        if (m_opt.y > 0.5) m = 1 - m;
+    }
+    if (m_wipe.x > 0.5) {
+        float v;
+        int k = (int)(m_wipe.x + 0.5);
+        if (k == 1) v = uv.x;
+        else if (k == 2) v = 1 - uv.x;
+        else if (k == 3) v = uv.y;
+        else if (k == 4) v = 1 - uv.y;
+        else v = length(px - m_size.xy * 0.5) / length(m_size.xy * 0.5);
+        float soft = 0.04;
+        m *= saturate((m_wipe.y * (1 + soft) - v) / soft);
+    }
+    return m;
+}
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut vsmain(uint id : SV_VertexID) {
     float2 uv = float2(id & 1, id >> 1);          // 0,0 1,0 0,1 1,1(三角形ストリップ)
@@ -30,7 +68,7 @@ VSOut vsmain(uint id : SV_VertexID) {
 float4 psmain(VSOut i) : SV_Target {
     float4 c = tex.Sample(smp, i.uv);   // 素材はストレートアルファ
     c.rgb *= c.a;                       // 乗算済みにして重ねる
-    return c * opacity;
+    return c * (opacity * mask_at(i.uv));
 }
 
 // 四隅の貼り付け: 画面全体を覆う三角形を描き、各画素から素材の座標を射影変換で逆算する
@@ -56,7 +94,7 @@ float4 ps_pin(VSOut i) : SV_Target {
     if (any(uv < 0) || any(uv > 1)) discard;
     float4 c = tex.SampleLevel(smp, uv, 0);
     c.rgb *= c.a;
-    return c * pin_opacity;
+    return c * (pin_opacity * mask_at(uv));
 }
 "#;
 
@@ -98,6 +136,7 @@ pub struct Gpu {
     vs_full: ID3D11VertexShader,
     ps_pin: ID3D11PixelShader,
     cb_pin: ID3D11Buffer,
+    cb_mask: ID3D11Buffer,
     blend: ID3D11BlendState,
     sampler: ID3D11SamplerState,
     raster: ID3D11RasterizerState,
@@ -120,6 +159,20 @@ struct PinCb {
 }
 
 type M3 = [[f64; 3]; 3];
+
+/// レイヤーのマスクとワイプ(`Gpu::set_mask` で、次に描くレイヤーに使う)。
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct MaskCb {
+    /// 中心 x, y(素材の左上原点のピクセル)、半分の幅・高さ
+    pub rect: [f32; 4],
+    /// 形(0 無し, 1 四角, 2 楕円)、反転(0/1)、ぼかし(ピクセル)、未使用
+    pub opt: [f32; 4],
+    /// ワイプの種類(0 無し, 1 左→右, 2 右→左, 3 上→下, 4 下→上, 5 円)、見えている割合
+    pub wipe: [f32; 4],
+    /// 素材の幅・高さ
+    pub size: [f32; 4],
+}
 
 /// 単位正方形(u, v ∈ [0,1])を四角形 q(左上・右上・右下・左下)へ写す射影変換。
 pub fn square_to_quad(q: &[[f64; 2]; 4]) -> M3 {
@@ -184,7 +237,7 @@ impl Gpu {
         let vfb = compile("vs_full", "vs_5_0")?;
         let ppb = compile("ps_pin", "ps_5_0")?;
         let (mut vs, mut ps, mut cb, mut blend, mut sampler, mut raster) = (None, None, None, None, None, None);
-        let (mut vs_full, mut ps_pin, mut cb_pin) = (None, None, None);
+        let (mut vs_full, mut ps_pin, mut cb_pin, mut cb_mask) = (None, None, None, None);
         unsafe {
             device.CreateVertexShader(&vsb, None, Some(&mut vs)).map_err(e("頂点シェーダ"))?;
             device.CreatePixelShader(&psb, None, Some(&mut ps)).map_err(e("ピクセルシェーダ"))?;
@@ -201,6 +254,20 @@ impl Gpu {
                     },
                     None,
                     Some(&mut cb_pin),
+                )
+                .map_err(e("定数バッファ"))?;
+            let zero = MaskCb::default();
+            device
+                .CreateBuffer(
+                    &D3D11_BUFFER_DESC {
+                        ByteWidth: std::mem::size_of::<MaskCb>() as u32,
+                        Usage: D3D11_USAGE_DYNAMIC,
+                        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                        ..Default::default()
+                    },
+                    Some(&D3D11_SUBRESOURCE_DATA { pSysMem: &zero as *const MaskCb as _, ..Default::default() }),
+                    Some(&mut cb_mask),
                 )
                 .map_err(e("定数バッファ"))?;
             device
@@ -245,7 +312,7 @@ impl Gpu {
                 .CreateRasterizerState(&D3D11_RASTERIZER_DESC { FillMode: D3D11_FILL_SOLID, CullMode: D3D11_CULL_NONE, DepthClipEnable: true.into(), ..Default::default() }, Some(&mut raster))
                 .map_err(e("ラスタライザ"))?;
         }
-        Ok(Self { device, ctx, vs: vs.unwrap(), ps: ps.unwrap(), cb: cb.unwrap(), vs_full: vs_full.unwrap(), ps_pin: ps_pin.unwrap(), cb_pin: cb_pin.unwrap(), blend: blend.unwrap(), sampler: sampler.unwrap(), raster: raster.unwrap() })
+        Ok(Self { device, ctx, vs: vs.unwrap(), ps: ps.unwrap(), cb: cb.unwrap(), vs_full: vs_full.unwrap(), ps_pin: ps_pin.unwrap(), cb_pin: cb_pin.unwrap(), cb_mask: cb_mask.unwrap(), blend: blend.unwrap(), sampler: sampler.unwrap(), raster: raster.unwrap() })
     }
 
     pub fn create_texture(&self, width: u32, height: u32, bgra: Option<&[u8]>, render_target: bool) -> Result<Texture, String> {
@@ -288,6 +355,17 @@ impl Gpu {
         unsafe { self.ctx.ClearRenderTargetView(rtv, &rgba) };
     }
 
+    /// 次に描くレイヤーのマスクとワイプを決める(無しにするには `MaskCb::default()`)。
+    pub fn set_mask(&self, m: &MaskCb) {
+        unsafe {
+            let mut mp = D3D11_MAPPED_SUBRESOURCE::default();
+            if self.ctx.Map(&self.cb_mask, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mp)).is_ok() {
+                std::ptr::copy_nonoverlapping(m as *const MaskCb as *const u8, mp.pData as *mut u8, std::mem::size_of::<MaskCb>());
+                self.ctx.Unmap(&self.cb_mask, 0);
+            }
+        }
+    }
+
     /// レイヤーを 1 枚描く。
     pub fn draw(&self, rtv: &ID3D11RenderTargetView, target: (u32, u32), src: &Texture, p: &Placement) {
         let (tw, th) = (target.0 as f64, target.1 as f64);
@@ -320,6 +398,7 @@ impl Gpu {
             ctx.VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
             ctx.PSSetShader(&self.ps, None);
             ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            ctx.PSSetConstantBuffers(2, Some(&[Some(self.cb_mask.clone())]));
             ctx.PSSetShaderResources(0, Some(&[Some(src.srv.clone())]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.Draw(4, 0);
@@ -357,6 +436,7 @@ impl Gpu {
             ctx.VSSetShader(&self.vs_full, None);
             ctx.PSSetShader(&self.ps_pin, None);
             ctx.PSSetConstantBuffers(1, Some(&[Some(self.cb_pin.clone())]));
+            ctx.PSSetConstantBuffers(2, Some(&[Some(self.cb_mask.clone())]));
             ctx.PSSetShaderResources(0, Some(&[Some(src.srv.clone())]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.Draw(3, 0);

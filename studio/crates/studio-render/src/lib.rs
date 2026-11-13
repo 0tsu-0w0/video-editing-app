@@ -30,7 +30,7 @@ enum Source {
 
 pub struct Renderer {
     pub gpu: Gpu,
-    sources: HashMap<Id, Source>,
+    sources: HashMap<(Id, u8), Source>,
     target: Option<(Texture, windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView)>,
     /// 読み込めなかった素材(画面に出すための一覧)
     pub errors: Vec<String>,
@@ -42,14 +42,15 @@ impl Renderer {
         Self { gpu, sources: HashMap::new(), target: None, errors: vec![], model_pipe: None }
     }
 
-    fn source(&mut self, project: &Project, asset: Id) -> &mut Source {
+    fn source(&mut self, project: &Project, asset: Id, slot: u8) -> &mut Source {
+        let key = (asset, slot);
         // 文字の内容が変わっていたら作り直す
-        if let (Some(Source::Text { made_from, .. }), Some(a)) = (self.sources.get(&asset), project.assets.get(&asset)) {
+        if let (Some(Source::Text { made_from, .. }), Some(a)) = (self.sources.get(&key), project.assets.get(&asset)) {
             if *made_from != a.kind {
-                self.sources.remove(&asset);
+                self.sources.remove(&key);
             }
         }
-        if !self.sources.contains_key(&asset) {
+        if !self.sources.contains_key(&key) {
             let s = match project.assets.get(&asset) {
                 None => Source::Broken(format!("素材 {asset} がありません")),
                 Some(a) => {
@@ -79,16 +80,18 @@ impl Renderer {
                 }
             };
             if let Source::Broken(m) = &s {
-                self.errors.push(m.clone());
+                if slot == 0 {
+                    self.errors.push(m.clone());
+                }
             }
-            self.sources.insert(asset, s);
+            self.sources.insert(key, s);
         }
-        self.sources.get_mut(&asset).unwrap()
+        self.sources.get_mut(&key).unwrap()
     }
 
     /// 素材の差し替えなどで、キャッシュを捨てる。
     pub fn forget(&mut self, asset: Id) {
-        self.sources.remove(&asset);
+        self.sources.retain(|k, _| k.0 != asset);
     }
 
     /// 時刻 t の映像を合成し、そのテクスチャを返す(プロジェクトの大きさ、背景は黒)。
@@ -114,7 +117,7 @@ impl Renderer {
             }
             let pipe = self.model_pipe.as_ref().map(|p| p as *const model::ModelPipeline);
             let gpu = &self.gpu as *const Gpu;
-            let src = self.source(project, layer.asset);
+            let src = self.source(project, layer.asset, layer.slot);
             let gpu = unsafe { &*gpu };
             let tex: &Texture = match src {
                 Source::Video { reader, tex, shown } => {
@@ -146,6 +149,7 @@ impl Renderer {
                 }
                 Source::Broken(_) => continue,
             };
+            gpu.set_mask(&mask_cb(&layer, tex.width, tex.height));
             if let Some(c) = &layer.corners {
                 gpu.draw_pinned(&rtv, (w, h), tex, c, layer.opacity);
                 continue;
@@ -174,6 +178,27 @@ impl Renderer {
         let tex = &self.target.as_ref().unwrap().0;
         self.gpu.read(tex)
     }
+}
+
+/// レイヤーのマスクとワイプを、シェーダに渡す形にする。
+fn mask_cb(l: &studio_core::eval::Layer, w: u32, h: u32) -> gpu::MaskCb {
+    use studio_core::project::{MaskShape, TransitionKind as K};
+    let mut m = gpu::MaskCb { size: [w as f32, h as f32, 0.0, 0.0], ..Default::default() };
+    if let Some(k) = &l.mask {
+        m.rect = [(w as f64 / 2.0 + k.x) as f32, (h as f64 / 2.0 + k.y) as f32, (k.w / 2.0) as f32, (k.h / 2.0) as f32];
+        m.opt = [if k.shape == MaskShape::Rect { 1.0 } else { 2.0 }, k.invert as u8 as f32, k.feather as f32, 0.0];
+    }
+    if let Some((kind, q)) = l.wipe {
+        let n = match kind {
+            K::WipeRight => 1.0,
+            K::WipeLeft => 2.0,
+            K::WipeDown => 3.0,
+            K::WipeUp => 4.0,
+            _ => 5.0,
+        };
+        m.wipe = [n, q as f32, 0.0, 0.0];
+    }
+    m
 }
 
 /// 直近にミックスした区間の音量(ピーク、直線)。

@@ -429,3 +429,67 @@ fn track_audio_and_effects_validate_and_undo() {
     ed.undo();
     assert!(ed.project.track(a1).unwrap().audio.is_default());
 }
+
+#[test]
+fn transitions_crossfade_slide_and_masks() {
+    use crate::command::Edge;
+    let (mut ed, v1, _v2, _a1, movie, img) = setup();
+    let o = ed
+        .transaction(
+            "配置",
+            vec![
+                AddClip { track: v1, asset: movie, start: s(0.0), duration: Some(s(4.0)), source_in: Some(s(5.0)), id: None },
+                AddClip { track: v1, asset: img, start: s(4.0), duration: Some(s(4.0)), source_in: None, id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [a, b] = o.created[..] else { panic!() };
+    // JSON(AI の書き方)
+    let cmds: Vec<Command> = serde_json::from_str(&format!(r#"[{{"command": "set_transition", "clip": {}, "edge": "in", "transition": {{"kind": "fade", "duration": 1}}}}]"#, b.0)).unwrap();
+    ed.transaction("トランジション", cmds, Origin::Ai).unwrap();
+    // 1.5 秒は長すぎ(反対側と合わせて 4 秒を超える)
+    let tr = |k: TransitionKind, d: f64| Some(Transition { kind: k, duration: s(d) });
+    assert!(ed.execute(SetTransition { clip: b, edge: Edge::Out, transition: tr(TransitionKind::Fade, 3.5) }, Origin::Ai).is_err());
+    assert!(ed.execute(SetTransition { clip: b, edge: Edge::Out, transition: tr(TransitionKind::Fade, 0.0) }, Origin::Ai).is_err());
+    // クロスフェード: 4.5 秒では、前のクリップ(素材の 9.5 秒 = 終わりの先)を下に、後のクリップを半分の不透明度で
+    let l = layers_at(&ed.project, s(4.5));
+    assert_eq!(l.len(), 2, "{l:?}");
+    assert_eq!((l[0].clip, l[0].slot, l[1].clip, l[1].slot), (a, 1, b, 0));
+    assert_eq!(l[0].opacity, 1.0);
+    assert!((l[1].opacity - 0.5).abs() < 1e-9);
+    assert_eq!(l[0].source_time, s(9.5));
+    // 素材の長さを越える所では最後のフレームで止まる
+    let l = layers_at(&ed.project, s(4.99));
+    assert!(l[0].source_time < s(10.0));
+    assert_eq!(layers_at(&ed.project, s(5.2)).len(), 1);
+    // スライド: 始まりの途中では右にずれている
+    ed.execute(SetTransition { clip: b, edge: Edge::In, transition: tr(TransitionKind::SlideLeft, 1.0) }, Origin::User).unwrap();
+    let l = layers_at(&ed.project, s(4.5));
+    assert!((l[1].x - 1920.0 * 0.5).abs() < 1e-6, "{}", l[1].x);
+    // ワイプ: 終わりの途中で、見えている割合が減る
+    ed.execute(SetTransition { clip: b, edge: Edge::Out, transition: tr(TransitionKind::WipeRight, 1.0) }, Origin::User).unwrap();
+    let l = layers_at(&ed.project, s(7.75));
+    let (k, q) = l[0].wipe.unwrap();
+    assert!(k == TransitionKind::WipeRight && q < 0.5 && q > 0.0, "{q}");
+    // 分割: 左は始まり、右は終わりのトランジションだけ残る
+    let r = ed.execute(SplitClip { clip: b, at: s(6.0), new_id: None }, Origin::User).unwrap().created[0];
+    let (lc, rc) = (ed.project.clip(b).unwrap().clone(), ed.project.clip(r).unwrap().clone());
+    assert!(lc.transition_in.is_some() && lc.transition_out.is_none() && rc.transition_in.is_none() && rc.transition_out.is_some());
+    // 短くして収まらなくなったら外れる
+    ed.execute(TrimClip { clip: r, start: None, duration: Some(s(0.5)), source_in: None }, Origin::User).unwrap();
+    assert!(ed.project.clip(r).unwrap().transition_out.is_none());
+    ed.project.check().unwrap();
+
+    // マスク: 初めて付けると素材(800x1200)の半分の大きさ。外すと消える
+    ed.execute(SetMask { clip: b, mask: Some(Mask { shape: MaskShape::Ellipse, invert: true }) }, Origin::Ai).unwrap();
+    let l = layers_at(&ed.project, s(5.5));
+    let m = l.last().unwrap().mask.unwrap();
+    assert_eq!((m.w, m.h, m.invert, m.shape), (400.0, 600.0, true, MaskShape::Ellipse));
+    ed.execute(SetKey { clip: b, param: "mask_x".into(), time: s(1.0), value: 50.0, interp: Interp::Linear }, Origin::User).unwrap();
+    assert_eq!(layers_at(&ed.project, s(5.5)).last().unwrap().mask.unwrap().x, 50.0);
+    let p2 = Project::from_json(&ed.project.to_json()).unwrap();
+    assert_eq!(p2, ed.project);
+    ed.execute(SetMask { clip: b, mask: None }, Origin::User).unwrap();
+    assert!(layers_at(&ed.project, s(5.5)).last().unwrap().mask.is_none());
+}

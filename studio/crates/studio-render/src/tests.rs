@@ -478,3 +478,78 @@ fn mixer_gain_pan_solo_eq_compressor_ducking() {
     assert!(get(tb).1 > 0.03 && l.master.0 > 0.03);
     eprintln!("ダッキング: 前 {pre:.3} → 声の間 {during:.3} → 後 {post:.3} / EQ ×{:.2} / コンプ {c:.3}", after / before);
 }
+
+#[test]
+fn masks_wipes_and_crossfade_render() {
+    use studio_core::command::Edge;
+    use studio_core::project::{Mask, MaskShape, Transition, TransitionKind};
+    let d = dir();
+    let (red, blue) = (d.join("red.png"), d.join("blue.png"));
+    image::save_buffer(&red, &[255, 0, 0, 255].repeat(200 * 200), 200, 200, image::ExtendedColorType::Rgba8).unwrap();
+    image::save_buffer(&blue, &[0, 0, 255, 255].repeat(200 * 200), 200, 200, image::ExtendedColorType::Rgba8).unwrap();
+    let mut ed = Editor::new(Project::default());
+    ed.execute(SetSettings { width: Some(W), height: Some(H), frame_rate: None, sample_rate: None }, Origin::User).unwrap();
+    let o = ed
+        .transaction(
+            "準備",
+            vec![
+                AddTrack { kind: TrackKind::Video, name: None, index: None, id: None },
+                ImportAsset { name: "red".into(), path: red.to_string_lossy().into(), kind: studio_media::probe(&red).unwrap(), id: None },
+                ImportAsset { name: "blue".into(), path: blue.to_string_lossy().into(), kind: studio_media::probe(&blue).unwrap(), id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [tr, ar, ab] = o.created[..] else { panic!() };
+    let o = ed
+        .transaction(
+            "配置",
+            vec![
+                AddClip { track: tr, asset: ar, start: s(0.0), duration: Some(s(2.0)), source_in: None, id: None },
+                AddClip { track: tr, asset: ab, start: s(2.0), duration: Some(s(2.0)), source_in: None, id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [cr, cb] = o.created[..] else { panic!() };
+    let mut r = Renderer::new(Gpu::new(None).unwrap());
+    // 画面中央 (320,180) を原点にした位置の画素 (R, G, B)
+    let px = |img: &[u8], x: i32, y: i32| {
+        let i = (((180 + y) as u32 * W + (320 + x) as u32) * 4) as usize;
+        (img[i + 2], img[i + 1], img[i])
+    };
+    // 楕円のマスク(幅・高さ 100): 中心は赤、半径 70 の所は黒。反転すると逆
+    ed.execute(SetMask { clip: cr, mask: Some(Mask { shape: MaskShape::Ellipse, invert: false }) }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    assert_eq!(px(&img, 0, 0), (255, 0, 0));
+    assert_eq!(px(&img, 45, 0), (255, 0, 0));
+    assert_eq!(px(&img, 70, 0), (0, 0, 0));
+    assert_eq!(px(&img, 45, 45), (0, 0, 0), "楕円の外(四角なら内側)");
+    ed.execute(SetMask { clip: cr, mask: Some(Mask { shape: MaskShape::Rect, invert: true }) }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    assert_eq!(px(&img, 0, 0), (0, 0, 0));
+    assert_eq!(px(&img, 70, 0), (255, 0, 0));
+    // ぼかし 40: 縁の上はおよそ半分
+    ed.execute(SetMask { clip: cr, mask: Some(Mask { shape: MaskShape::Rect, invert: false }) }, Origin::User).unwrap();
+    ed.execute(SetParam { clip: cr, param: "mask_feather".into(), value: 40.0 }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    let edge = px(&img, 50, 0).0;
+    assert!((100..=160).contains(&edge), "ぼかしの縁 {edge}");
+    ed.execute(SetMask { clip: cr, mask: None }, Origin::User).unwrap();
+
+    // クロスフェード: 青の始まりに 1 秒のフェード → 2.5 秒(半分)で赤と青が半々
+    ed.execute(SetTransition { clip: cb, edge: Edge::In, transition: Some(Transition { kind: TransitionKind::Fade, duration: s(1.0) }) }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(2.5)).unwrap();
+    let (rr, _, bb) = px(&img, 0, 0);
+    assert!((110..=145).contains(&rr) && (110..=145).contains(&bb), "クロスフェード {rr},{bb}");
+    // ワイプ(左→右): 2.5 秒では左側が青、右側はまだ赤
+    ed.execute(SetTransition { clip: cb, edge: Edge::In, transition: Some(Transition { kind: TransitionKind::WipeRight, duration: s(1.0) }) }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(2.5)).unwrap();
+    assert_eq!(px(&img, -80, 0), (0, 0, 255));
+    assert_eq!(px(&img, 80, 0), (255, 0, 0));
+    // 円形: 中央から青
+    ed.execute(SetTransition { clip: cb, edge: Edge::In, transition: Some(Transition { kind: TransitionKind::Circle, duration: s(1.0) }) }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(2.4)).unwrap();
+    assert_eq!(px(&img, 0, 0), (0, 0, 255));
+    assert_eq!(px(&img, 95, 95), (255, 0, 0));
+}
