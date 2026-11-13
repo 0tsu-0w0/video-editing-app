@@ -54,6 +54,12 @@ fn tools() -> Value {
              "clip": {"type": "integer", "description": "貼り付けるクリップの ID"},
              "corners": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}},
              "time": time}}},
+        {"name": "track_person", "description": "クリップ(clip)を、その下のトラックの動画に写っている人物の部位(part)の動きに追従させる。x, y は time の時点の画面で、その人物の体の上の点(画面中央が原点の画素、y は下向き)。複数人いても、選んだ人を追い続ける。人物の推定モデルが必要(無ければエラーで置き場所を返す)。解析は裏で進むので track_status で結果を確認する",
+         "inputSchema": {"type": "object", "required": ["clip", "x", "y"], "properties": {
+             "clip": {"type": "integer", "description": "追従させるクリップの ID"},
+             "x": {"type": "number"}, "y": {"type": "number"},
+             "part": {"type": "string", "enum": ["head", "neck", "body", "hips", "left_hand", "right_hand", "left_foot", "right_foot"], "description": "部位(既定は head)。左右は写っている本人から見た左右"},
+             "time": time}}},
         {"name": "track_status", "description": "トラッキングの進み具合と、最後の結果", "inputSchema": {"type": "object", "properties": {}}},
     ])
 }
@@ -76,6 +82,7 @@ fn method_of(tool: &str) -> Option<&'static str> {
         "export_status" => "export_status",
         "track_follow" => "track_follow",
         "track_plane" => "track_plane",
+        "track_person" => "track_person",
         "track_status" => "track_status",
         _ => return None,
     })

@@ -1,0 +1,13 @@
+[package]
+name = "studio-pose"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+studio-media = { path = "../studio-media" }
+studio-track = { path = "../studio-track" }
+ort = { version = "=2.0.0-rc.15", features = ["directml"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

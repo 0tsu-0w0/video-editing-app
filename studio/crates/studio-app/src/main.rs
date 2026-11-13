@@ -113,6 +113,10 @@ struct Studio {
     track_job: Option<TrackJob>,
     /// プレビューのクリックで追跡点を指定するのを待っている、追従させるクリップ
     pick_track: Option<Id>,
+    /// プレビューのクリックで人物を指定するのを待っている、追従させるクリップと部位
+    pick_person: Option<(Id, &'static str)>,
+    /// 人物の追従で使う部位(調整欄の選択)
+    person_part: &'static str,
     /// プレビューのクリックで四隅を指定中(貼り付けるクリップ、用途、指定済みの点)
     pick_corners: Option<(Id, PinPick, Vec<(f64, f64)>)>,
     /// ミキサーの窓を出すか
@@ -173,6 +177,8 @@ impl Studio {
             pending: VecDeque::new(),
             track_job: None,
             pick_track: None,
+            pick_person: None,
+            person_part: "head",
             pick_corners: None,
             show_mixer: std::env::var("STUDIO_SHOW_MIXER").is_ok_and(|v| v == "1"),
             meters: Default::default(),
@@ -483,6 +489,22 @@ impl Studio {
                 let from = params.get("time").cloned().and_then(|v| serde_json::from_value::<TimeArg>(v).ok()).map(|t| t.0).unwrap_or(self.playhead);
                 Done(self.start_plane_tracking(clip, corners.map(|c| (c[0], c[1])), from, true).map(|m| json!(format!("{m}。track_status で進み具合と結果を確認できます"))))
             }
+            "track_person" => {
+                if self.mcp_mode == McpMode::ReadOnly {
+                    return Done(Err("閲覧のみの設定です。アプリ上部の「外部からの操作」で変更できます".into()));
+                }
+                let clip = params.get("clip").and_then(|c| c.as_u64()).map(Id);
+                let (x, y) = (params.get("x").and_then(|v| v.as_f64()), params.get("y").and_then(|v| v.as_f64()));
+                let (Some(clip), Some(x), Some(y)) = (clip, x, y) else {
+                    return Done(Err("clip(追従させるクリップ ID)と x, y(人物の体の上の点。画面中央を原点とする画素)を指定してください".into()));
+                };
+                let part = params.get("part").and_then(|v| v.as_str()).unwrap_or("head");
+                let Some(part) = studio_pose::PARTS.iter().find(|p| p.0 == part).map(|p| p.0) else {
+                    return Done(Err(format!("part は {} のどれかにしてください", studio_pose::PARTS.iter().map(|p| p.0).collect::<Vec<_>>().join(" / "))));
+                };
+                let from = params.get("time").cloned().and_then(|v| serde_json::from_value::<TimeArg>(v).ok()).map(|t| t.0).unwrap_or(self.playhead);
+                Done(self.start_person_tracking(clip, (x, y), from, part, true).map(|m| json!(format!("{m}。track_status で進み具合と結果を確認できます"))))
+            }
             "track_status" => Done(Ok(match &self.track_job {
                 Some(j) => json!({"tracking": true, "done": j.done.load(Ordering::Relaxed), "total": j.total.load(Ordering::Relaxed)}),
                 None => json!({"tracking": false, "last_result": self.last_track_result}),
@@ -656,6 +678,56 @@ impl Studio {
         });
         self.track_job = Some(job);
         Ok(format!("クリップ {target} を貼る平面を解析中(追跡元: クリップ {source})"))
+    }
+
+    /// `target` を、その下の動画に写っている人物(画面上の点 `screen` にいる人)の部位 `part` に追従させる解析を始める。
+    fn start_person_tracking(&mut self, target: Id, screen: (f64, f64), from: Time, part: &'static str, from_mcp: bool) -> Result<String, String> {
+        if self.track_job.is_some() {
+            return Err("トラッキングの実行中です".into());
+        }
+        let dir = studio_pose::models_dir();
+        if !studio_pose::models_ready(&dir) {
+            return Err(format!("人物の推定モデルがありません。{} に rtmdet\\end2end.onnx と rtmpose\\end2end.onnx を置いてください(README 参照)", dir.display()));
+        }
+        let p = self.editor.project.clone();
+        let tc = p.clip(target).ok_or("追従させるクリップがありません")?.clone();
+        if !tc.contains(from) {
+            return Err(format!("再生位置({from})が、追従させるクリップの表示範囲({}〜{})の外です", tc.start, tc.end()));
+        }
+        let source = studio_track::source_below(&p, target, from).ok_or("このクリップより下のトラックに、再生位置で表示されている動画がありません")?;
+        let src_px = studio_track::screen_to_source(&p, source, from, screen).ok_or("指定した点は、下の動画の範囲の外です")?;
+        let job = TrackJob {
+            done: Arc::new(AtomicI64::new(0)),
+            total: Arc::new(AtomicI64::new(1)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            result: Arc::new(Mutex::new(None)),
+            from_mcp,
+            label: "人物の追従",
+        };
+        let (done, total, cancel, result) = (job.done.clone(), job.total.clone(), job.cancel.clone(), job.result.clone());
+        let part_name = studio_pose::PARTS.iter().find(|x| x.0 == part).map_or(part, |x| x.1);
+        std::thread::spawn(move || {
+            let r = (|| {
+                let mut models = studio_pose::PoseModels::load(&dir)?;
+                let keys = studio_pose::track_person(&mut models, &p, source, from, tc.end(), src_px, |d, t| {
+                    done.store(d as i64, Ordering::Relaxed);
+                    total.store(t as i64, Ordering::Relaxed);
+                    !cancel.load(Ordering::Relaxed)
+                })?;
+                let tr = studio_pose::part_track(&keys, part)?;
+                let ok = tr.iter().filter(|k| k.pos.is_some()).count();
+                let lost = keys.iter().find(|k| k.bbox.is_none()).map(|k| k.time);
+                let cmds = studio_track::follow_commands(&p, target, source, &tr)?;
+                let msg = match lost {
+                    Some(t) => format!("人物の{part_name}を {ok} フレーム追い、{t} で見失ったのでそこで止めました(以降は手で調整してください)"),
+                    None => format!("人物の{part_name}を {ok} フレーム追い、クリップ {target} を追従させました"),
+                };
+                Ok((cmds, msg))
+            })();
+            *result.lock().unwrap() = Some(r);
+        });
+        self.track_job = Some(job);
+        Ok(format!("クリップ {target} を人物の{part_name}に追従させる解析中(追跡元: クリップ {source})"))
     }
 
     /// 終わったトラッキングの結果を反映する。
@@ -1234,6 +1306,29 @@ impl Studio {
                     self.status = "プレビュー上で、追いかけたい点(模様のはっきりした所)をクリックしてください".into();
                 }
             }
+            // 人物の部位に追従
+            ui.horizontal(|ui| {
+                let picking = self.pick_person.is_some_and(|(c, _)| c == id);
+                let label = if picking { "人物のクリックを待っています(取り消す)" } else { "人物に追従させる" };
+                if ui
+                    .add_enabled(self.track_job.is_none(), egui::Button::new(label))
+                    .on_hover_text("下のトラックの動画に写っている人物をプレビューでクリックすると、選んだ部位の動きに合わせてこのクリップが動きます(再生位置からクリップの終わりまで)")
+                    .clicked()
+                {
+                    self.pick_person = if picking { None } else { Some((id, self.person_part)) };
+                    self.pick_track = None;
+                    self.pick_corners = None;
+                    if !picking {
+                        self.status = "プレビュー上で、追いかけたい人物の体をクリックしてください".into();
+                    }
+                }
+                let cur = studio_pose::PARTS.iter().find(|p| p.0 == self.person_part).map_or("頭", |p| p.1);
+                egui::ComboBox::from_id_salt(("part", id)).selected_text(cur).width(90.0).show_ui(ui, |ui| {
+                    for (k, n, _) in studio_pose::PARTS {
+                        ui.selectable_value(&mut self.person_part, k, n);
+                    }
+                });
+            });
             // 四隅の貼り付け(壁・机・画面などの平面に合わせて変形する)
             let pins = self.editor.project.clip(id).map_or(0, |c| c.pin.len());
             ui.horizontal_wrapped(|ui| {
@@ -1367,6 +1462,14 @@ impl Studio {
                                 }
                             };
                         }
+                    }
+                }
+                if let Some((target, part)) = self.pick_person {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    ui.painter().rect_stroke(img, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 220, 255)), egui::StrokeKind::Outside);
+                    if let Some(pos) = resp.clicked().then(|| resp.interact_pointer_pos()).flatten().filter(|p| img.contains(*p)) {
+                        self.pick_person = None;
+                        self.status = self.start_person_tracking(target, to_screen(pos), self.playhead, part, false).unwrap_or_else(|e| e);
                     }
                 }
                 if let Some(target) = self.pick_track {
