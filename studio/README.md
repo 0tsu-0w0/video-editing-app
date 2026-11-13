@@ -152,8 +152,8 @@ cargo build --release -p studio-app
 人物の追従には、OpenMMLab の 2 つのモデル(ONNX 形式)が必要。アプリには含めていない。
 
 ```
-%LOCALAPPDATA%\ForgeStudio\modelstmdet\end2end.onnx    人物の検出(RTMDet-nano、約 4MB)
-%LOCALAPPDATA%\ForgeStudio\modelstmpose\end2end.onnx   関節の推定(RTMPose-m、約 52MB)
+%LOCALAPPDATA%\ForgeStudio\models\rtmdet\end2end.onnx    人物の検出(RTMDet-nano、約 4MB)
+%LOCALAPPDATA%\ForgeStudio\models\rtmpose\end2end.onnx   関節の推定(RTMPose-m、約 52MB)
 ```
 
 場所は環境変数 `STUDIO_POSE_MODELS` で変えられる。入手先は MMPose の RTMPose の配布ページ(ONNX の SDK 版)。
