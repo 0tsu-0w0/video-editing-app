@@ -33,7 +33,7 @@ fn tools() -> Value {
              "commands": {"type": "array", "items": {"type": "object"}, "description": "コマンドの配列(書式は get_command_schema)"},
              "label": {"type": "string", "description": "操作履歴に表示する名前(例: 「キャラを右から登場させる」)"},
              "dry_run": {"type": "boolean", "description": "true なら実行せず、成功するかと変更内容だけを返す"}}}},
-        {"name": "import_file", "description": "この PC にある動画・音声・画像ファイルを素材として読み込む(配置は execute_commands の add_clip で行う)",
+        {"name": "import_file", "description": "この PC にある動画・音声・画像・3D モデル(.gltf / .glb / .vrm)のファイルを素材として読み込む(配置は execute_commands の add_clip で行う)",
          "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string", "description": "ファイルの絶対パス"}}}},
         {"name": "render_frame", "description": "指定した時刻の画面を PNG 画像で返す(編集結果の確認用)",
          "inputSchema": {"type": "object", "properties": {"time": time, "width": {"type": "integer", "description": "画像の幅(既定 640、最大 1920)"}}}},

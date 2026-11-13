@@ -7,6 +7,7 @@ edition.workspace = true
 studio-core = { path = "../studio-core" }
 studio-media = { path = "../studio-media" }
 ab_glyph = "0.2"
+gltf = "1.4"
 
 [dependencies.windows]
 version = "0.62"

@@ -192,7 +192,7 @@ impl Studio {
 
     fn import_files(&mut self, files: Vec<PathBuf>) {
         for f in files {
-            match studio_media::probe(&f) {
+            match probe(&f) {
                 Ok(kind) => {
                     let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     self.run("素材の読み込み", vec![ImportAsset { name, path: f.to_string_lossy().into(), kind, id: None }]);
@@ -399,9 +399,9 @@ impl Studio {
                 let (label, commands) = if method == "import_file" {
                     let Some(path) = params.get("path").and_then(|x| x.as_str()) else { return Done(Err("path を指定してください".into())) };
                     let path = PathBuf::from(path);
-                    let kind = match studio_media::probe(&path) {
+                    let kind = match probe(&path) {
                         Ok(k) => k,
-                        Err(e) => return Done(Err(e.to_string())),
+                        Err(e) => return Done(Err(e)),
                     };
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     ("素材の読み込み".to_string(), vec![Command::ImportAsset { name, path: path.to_string_lossy().into(), kind, id: None }])
@@ -854,7 +854,7 @@ impl Studio {
         egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("素材を読み込む").clicked() {
-                    if let Some(f) = rfd::FileDialog::new().add_filter("動画・音声・画像", &["mp4", "mov", "m4v", "mkv", "wmv", "avi", "mp3", "wav", "m4a", "aac", "flac", "png", "jpg", "jpeg", "bmp", "gif", "webp"]).pick_files() {
+                    if let Some(f) = rfd::FileDialog::new().add_filter("動画・音声・画像", &["mp4", "mov", "m4v", "mkv", "wmv", "avi", "mp3", "wav", "m4a", "aac", "flac", "png", "jpg", "jpeg", "bmp", "gif", "webp", "gltf", "glb", "vrm"]).pick_files() {
                         self.import_files(f);
                     }
                 }
@@ -966,6 +966,8 @@ impl Studio {
                         AssetKind::Video { width, height, duration, .. } => format!("動画 {width}×{height} {duration}"),
                         AssetKind::Audio { duration, .. } => format!("音声 {duration}"),
                         AssetKind::Image { width, height } => format!("画像 {width}×{height}"),
+                        AssetKind::Model { animation } if *animation > 0.0 => format!("3D モデル(動き {animation:.1} 秒)"),
+                        AssetKind::Model { .. } => "3D モデル".into(),
                         AssetKind::Text { text, .. } => format!("文字 {}", text.chars().take(16).collect::<String>().replace('\n', " ")),
                     };
                     ui.group(|ui| {
@@ -1086,15 +1088,19 @@ impl Studio {
         });
         ui.separator();
         let local = (self.playhead - clip.start).max(Time::ZERO).min(clip.duration);
-        let labels = [("x", "X 位置"), ("y", "Y 位置"), ("scale", "拡大率"), ("rotation", "回転"), ("opacity", "不透明度"), ("volume", "音量"), ("pan", "パン")];
+        let labels = [("x", "X 位置"), ("y", "Y 位置"), ("scale", "拡大率"), ("rotation", "回転"), ("rot_y", "3D 横の向き"), ("rot_x", "3D 縦の傾き"), ("opacity", "不透明度"), ("volume", "音量"), ("pan", "パン")];
+        let is_model = matches!(self.editor.project.assets.get(&clip.asset).map(|a| &a.kind), Some(AssetKind::Model { .. }));
         let mut commit: Option<Command> = None;
         for (name, label) in labels {
+            if matches!(name, "rot_x" | "rot_y") && !is_model {
+                continue;
+            }
             let param = clip.params.get(name).unwrap();
             let (_, lo, hi) = *PARAMS.iter().find(|p| p.0 == name).unwrap();
             let range = match name {
                 "x" | "y" => -4000.0..=4000.0,
                 "scale" => 0.0..=8.0,
-                "rotation" => -360.0..=360.0,
+                "rotation" | "rot_x" | "rot_y" => -360.0..=360.0,
                 "volume" => 0.0..=4.0,
                 _ => lo..=hi,
             };
@@ -1293,6 +1299,15 @@ impl Studio {
         self.preview = Some((egui::TextureId::User(u64::MAX), key));
         PENDING_SRV.with(|p| *p.borrow_mut() = Some(srv));
         let _ = size;
+    }
+}
+
+/// ファイルを素材として調べる(3D モデルは中身を読んで確かめる)。
+fn probe(path: &std::path::Path) -> Result<AssetKind, String> {
+    if studio_render::model::is_model_path(path) {
+        studio_render::model::probe(path)
+    } else {
+        studio_media::probe(path).map_err(|e| e.to_string())
     }
 }
 

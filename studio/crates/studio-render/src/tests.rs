@@ -239,3 +239,112 @@ fn corner_pin_draws_perspective_quad() {
     }
     assert!(map(0.5, 0.5).1 < 0.0);
 }
+
+/// 幅 2・高さ 1・厚さ 0.2 の赤い板。1 秒で上へ 1 動くアニメーション付き。
+fn write_plate(path: &Path) {
+    let (x, y, z) = (1.0f32, 0.5f32, 0.1f32);
+    let pos: Vec<[f32; 3]> = (0..8).map(|i| [if i & 1 == 0 { -x } else { x }, if i & 2 == 0 { -y } else { y }, if i & 4 == 0 { -z } else { z }]).collect();
+    let quads = [[0, 1, 3, 2], [4, 6, 7, 5], [0, 4, 5, 1], [2, 3, 7, 6], [0, 2, 6, 4], [1, 5, 7, 3]];
+    let idx: Vec<u16> = quads.iter().flat_map(|q| [q[0], q[1], q[2], q[0], q[2], q[3]]).collect();
+    let mut buf: Vec<u8> = vec![];
+    for p in &pos {
+        for v in p {
+            buf.extend(v.to_le_bytes());
+        }
+    }
+    for i in &idx {
+        buf.extend(i.to_le_bytes());
+    }
+    for v in [0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+        buf.extend(v.to_le_bytes());
+    }
+    let b64 = {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::new();
+        for c in buf.chunks(3) {
+            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            for k in 0..4 {
+                s.push(if k <= c.len() { T[(n >> (18 - 6 * k) & 63) as usize] as char } else { '=' });
+            }
+        }
+        s
+    };
+    let json = format!(
+        r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":0}}]}}],
+"materials":[{{"pbrMetallicRoughness":{{"baseColorFactor":[1,0,0,1]}}}}],
+"buffers":[{{"byteLength":{len},"uri":"data:application/octet-stream;base64,{b64}"}}],
+"bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":96}},{{"buffer":0,"byteOffset":96,"byteLength":72}},{{"buffer":0,"byteOffset":168,"byteLength":8}},{{"buffer":0,"byteOffset":176,"byteLength":24}}],
+"accessors":[{{"bufferView":0,"componentType":5126,"count":8,"type":"VEC3","min":[-1,-0.5,-0.1],"max":[1,0.5,0.1]}},
+{{"bufferView":1,"componentType":5123,"count":36,"type":"SCALAR"}},
+{{"bufferView":2,"componentType":5126,"count":2,"type":"SCALAR","min":[0],"max":[1]}},
+{{"bufferView":3,"componentType":5126,"count":2,"type":"VEC3"}}],
+"animations":[{{"channels":[{{"sampler":0,"target":{{"node":0,"path":"translation"}}}}],"samplers":[{{"input":2,"output":3}}]}}]}}"#,
+        len = buf.len()
+    );
+    std::fs::write(path, json).unwrap();
+}
+
+/// 赤い画素の (数, 左右の幅, 中心 x, 中心 y)。
+fn red_stats(px: &[u8], w: usize) -> (usize, usize, f64, f64) {
+    let (mut n, mut lo, mut hi, mut sx, mut sy) = (0, usize::MAX, 0, 0.0, 0.0);
+    for (i, p) in px.chunks_exact(4).enumerate() {
+        if p[2] > 80 && p[1] < 40 && p[0] < 40 {
+            let (x, y) = (i % w, i / w);
+            n += 1;
+            lo = lo.min(x);
+            hi = hi.max(x);
+            sx += x as f64;
+            sy += y as f64;
+        }
+    }
+    (n, hi.saturating_sub(lo), sx / n.max(1) as f64, sy / n.max(1) as f64)
+}
+
+#[test]
+fn model_renders_rotates_and_animates() {
+    let d = dir();
+    let path = d.join("plate.gltf");
+    write_plate(&path);
+    let kind = model::probe(&path).unwrap();
+    assert_eq!(kind, AssetKind::Model { animation: 1.0 });
+    let mut ed = Editor::new(Project::default());
+    ed.execute(SetSettings { width: Some(W), height: Some(H), frame_rate: None, sample_rate: None }, Origin::User).unwrap();
+    let o = ed
+        .transaction(
+            "準備",
+            vec![
+                AddTrack { kind: TrackKind::Video, name: None, index: None, id: None },
+                ImportAsset { name: "plate".into(), path: path.to_string_lossy().into(), kind, id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let c = ed.execute(AddClip { track: o.created[0], asset: o.created[1], start: s(0.0), duration: None, source_in: None, id: None }, Origin::User).unwrap().created[0];
+    let mut r = Renderer::new(Gpu::new(None).unwrap());
+    let still = r.render_bgra(&ed.project, s(0.0)).unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let (n0, w0, cx0, cy0) = red_stats(&still, W as usize);
+    assert!(n0 > 5000, "板が描かれていない: {n0}");
+    // 囲む球が画面の高さの約 85% → 幅 2 の板は、だいたい画面の高さの 0.85 * 2 / √5.04 * ... の幅で中央に描かれる
+    assert!((cx0 - W as f64 / 2.0).abs() < 3.0 && (cy0 - H as f64 / 2.0).abs() < 3.0, "中央にない: {cx0},{cy0}");
+    // 横に 90 度向けると、薄い側面だけが見える
+    ed.execute(SetParam { clip: c, param: "rot_y".into(), value: 90.0 }, Origin::User).unwrap();
+    let side = r.render_bgra(&ed.project, s(0.0)).unwrap();
+    let (_, w90, _, _) = red_stats(&side, W as usize);
+    assert!(w90 * 4 < w0, "向きが変わっていない: 幅 {w0} → {w90}");
+    ed.execute(SetParam { clip: c, param: "rot_y".into(), value: 0.0 }, Origin::User).unwrap();
+    // 位置・拡大はふつうのレイヤーと同じ
+    ed.execute(SetParam { clip: c, param: "x".into(), value: 100.0 }, Origin::User).unwrap();
+    ed.execute(SetParam { clip: c, param: "scale".into(), value: 0.5 }, Origin::User).unwrap();
+    let moved = r.render_bgra(&ed.project, s(0.0)).unwrap();
+    let (_, wm, cxm, _) = red_stats(&moved, W as usize);
+    assert!((cxm - (W as f64 / 2.0 + 100.0)).abs() < 3.0, "x {cxm}");
+    assert!((wm as f64 - w0 as f64 / 2.0).abs() < 4.0, "幅 {wm} / {w0}");
+    // アニメーション: 0.5 秒で上へ 0.5 動く(画面では上 = y が小さい)
+    let anim = r.render_bgra(&ed.project, s(0.5)).unwrap();
+    let (_, _, _, cya) = red_stats(&anim, W as usize);
+    let (_, _, _, cym) = red_stats(&moved, W as usize);
+    assert!(cya < cym - 10.0, "動いていない: {cym} → {cya}");
+    eprintln!("板の幅 {w0}px → 横向き {w90}px、アニメーションで y {cym:.1} → {cya:.1}");
+}

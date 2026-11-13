@@ -5,6 +5,7 @@
 //! - `export`: プロジェクト全体を MP4 に書き出す
 
 pub mod gpu;
+pub mod model;
 pub mod text;
 
 use gpu::{Gpu, Placement, Texture};
@@ -21,6 +22,8 @@ enum Source {
     Image { tex: Texture },
     /// 文字。内容が変わったら作り直す
     Text { tex: Texture, made_from: AssetKind },
+    /// 3D モデル(クリップごとに描くので、素材ごとに 1 つ持つ)
+    Model(Box<model::Model>),
     Broken(String),
 }
 
@@ -30,11 +33,12 @@ pub struct Renderer {
     target: Option<(Texture, windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView)>,
     /// 読み込めなかった素材(画面に出すための一覧)
     pub errors: Vec<String>,
+    model_pipe: Option<model::ModelPipeline>,
 }
 
 impl Renderer {
     pub fn new(gpu: Gpu) -> Self {
-        Self { gpu, sources: HashMap::new(), target: None, errors: vec![] }
+        Self { gpu, sources: HashMap::new(), target: None, errors: vec![], model_pipe: None }
     }
 
     fn source(&mut self, project: &Project, asset: Id) -> &mut Source {
@@ -62,6 +66,10 @@ impl Renderer {
                             Err(e) => Source::Broken(format!("「{}」: {e}", a.name)),
                         },
                         AssetKind::Audio { .. } => Source::Broken("音声のみの素材".into()),
+                        AssetKind::Model { .. } => match model::Model::load(&self.gpu, path) {
+                            Ok(m) => Source::Model(Box::new(m)),
+                            Err(e) => Source::Broken(format!("「{}」: {e}", a.name)),
+                        },
                         AssetKind::Text { text, style } => match text::rasterize(text, style).and_then(|(w, h, px)| self.gpu.create_texture(w, h, Some(&px), false)) {
                             Ok(tex) => Source::Text { tex, made_from: a.kind.clone() },
                             Err(e) => Source::Broken(format!("「{}」: {e}", a.name)),
@@ -94,6 +102,16 @@ impl Renderer {
         self.gpu.clear(&rtv, [0.0, 0.0, 0.0, 1.0]);
         for layer in layers_at(project, t) {
             // 素材のテクスチャを用意(動画は表示するフレームが変わったときだけ更新)
+            if self.model_pipe.is_none() && matches!(project.assets.get(&layer.asset).map(|a| &a.kind), Some(AssetKind::Model { .. })) {
+                match model::ModelPipeline::new(&self.gpu) {
+                    Ok(p) => self.model_pipe = Some(p),
+                    Err(e) => {
+                        self.errors.push(format!("3D の描画を準備できません: {e}"));
+                        continue;
+                    }
+                }
+            }
+            let pipe = self.model_pipe.as_ref().map(|p| p as *const model::ModelPipeline);
             let gpu = &self.gpu as *const Gpu;
             let src = self.source(project, layer.asset);
             let gpu = unsafe { &*gpu };
@@ -115,6 +133,16 @@ impl Renderer {
                     tex.as_ref().unwrap()
                 }
                 Source::Image { tex } | Source::Text { tex, .. } => tex,
+                Source::Model(m) => {
+                    let pipe = unsafe { &*pipe.unwrap() };
+                    match m.render(gpu, pipe, (w, h), layer.local.secs_f64(), layer.rot_x, layer.rot_y) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("3D モデルを描けません: {e}");
+                            continue;
+                        }
+                    }
+                }
                 Source::Broken(_) => continue,
             };
             if let Some(c) = &layer.corners {

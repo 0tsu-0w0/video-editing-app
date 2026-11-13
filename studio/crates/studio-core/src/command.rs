@@ -409,6 +409,11 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 }
                 style.check().or_else(|m| err("invalid", m))?;
             }
+            if let AssetKind::Model { animation } = &kind {
+                if !animation.is_finite() || *animation < 0.0 {
+                    return err("invalid", "アニメーションの長さが不正です");
+                }
+            }
             if let Some(d) = kind.duration() {
                 if d <= Time::ZERO {
                     return err("invalid", "素材の長さが 0 です");

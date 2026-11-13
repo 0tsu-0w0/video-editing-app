@@ -45,6 +45,12 @@ pub enum AssetKind {
         #[serde(default)]
         style: TextStyle,
     },
+    /// 3D モデル(glTF / GLB / VRM)。長さの制限なし。アニメーションがあれば繰り返し再生する
+    Model {
+        /// アニメーションの長さ(秒、無ければ 0)
+        #[serde(default)]
+        animation: f64,
+    },
 }
 
 /// 文字の見た目。
@@ -106,7 +112,7 @@ impl AssetKind {
     pub fn duration(&self) -> Option<Time> {
         match self {
             AssetKind::Video { duration, .. } | AssetKind::Audio { duration, .. } => Some(*duration),
-            AssetKind::Image { .. } | AssetKind::Text { .. } => None,
+            AssetKind::Image { .. } | AssetKind::Text { .. } | AssetKind::Model { .. } => None,
         }
     }
     pub fn has_video(&self) -> bool {
@@ -232,6 +238,15 @@ pub struct ClipParams {
     pub volume: Param,
     /// 左右の定位(-1 = 左、0 = 中央、1 = 右)
     pub pan: Param,
+    /// 3D モデルの回転(度)。rot_x は縦(前後に傾ける)、rot_y は横(左右に向きを変える)
+    #[serde(default = "zero_param")]
+    pub rot_x: Param,
+    #[serde(default = "zero_param")]
+    pub rot_y: Param,
+}
+
+fn zero_param() -> Param {
+    Param::constant(0.0)
 }
 
 impl Default for ClipParams {
@@ -244,12 +259,14 @@ impl Default for ClipParams {
             opacity: Param::constant(1.0),
             volume: Param::constant(1.0),
             pan: Param::constant(0.0),
+            rot_x: Param::constant(0.0),
+            rot_y: Param::constant(0.0),
         }
     }
 }
 
 /// 項目名と、値の範囲。
-pub const PARAMS: [(&str, f64, f64); 7] = [
+pub const PARAMS: [(&str, f64, f64); 9] = [
     ("x", -100_000.0, 100_000.0),
     ("y", -100_000.0, 100_000.0),
     ("scale", 0.0, 100.0),
@@ -257,6 +274,8 @@ pub const PARAMS: [(&str, f64, f64); 7] = [
     ("opacity", 0.0, 1.0),
     ("volume", 0.0, 16.0),
     ("pan", -1.0, 1.0),
+    ("rot_x", -36_000.0, 36_000.0),
+    ("rot_y", -36_000.0, 36_000.0),
 ];
 
 impl ClipParams {
@@ -269,6 +288,8 @@ impl ClipParams {
             "opacity" => &self.opacity,
             "volume" => &self.volume,
             "pan" => &self.pan,
+            "rot_x" => &self.rot_x,
+            "rot_y" => &self.rot_y,
             _ => return None,
         })
     }
@@ -281,6 +302,8 @@ impl ClipParams {
             "opacity" => &mut self.opacity,
             "volume" => &mut self.volume,
             "pan" => &mut self.pan,
+            "rot_x" => &mut self.rot_x,
+            "rot_y" => &mut self.rot_y,
             _ => return None,
         })
     }

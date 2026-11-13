@@ -15,6 +15,11 @@ pub struct Layer {
     pub scale: f64,
     pub rotation: f64,
     pub opacity: f64,
+    /// 3D モデルの回転(度)
+    pub rot_x: f64,
+    pub rot_y: f64,
+    /// クリップの開始からの時刻(3D モデルのアニメーション用)
+    pub local: Time,
     /// 四隅の位置(あれば x / y / 拡大 / 回転の代わりに使う)
     pub corners: Option<crate::project::Corners>,
 }
@@ -40,6 +45,9 @@ pub fn layers_at(p: &Project, t: Time) -> Vec<Layer> {
             scale: pr.scale.eval(local),
             rotation: pr.rotation.eval(local),
             opacity,
+            rot_x: pr.rot_x.eval(local),
+            rot_y: pr.rot_y.eval(local),
+            local,
             corners: crate::project::eval_pin(&c.pin, local),
         });
     }

@@ -61,10 +61,14 @@ float4 ps_pin(VSOut i) : SV_Target {
 "#;
 
 pub fn compile(entry: &str, target: &str) -> Result<Vec<u8>, String> {
+    compile_src(SHADER, entry, target)
+}
+
+pub fn compile_src(src: &str, entry: &str, target: &str) -> Result<Vec<u8>, String> {
     let (e, t) = (CString::new(entry).unwrap(), CString::new(target).unwrap());
     let (mut code, mut err): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
     let r = unsafe {
-        D3DCompile(SHADER.as_ptr() as _, SHADER.len(), PCSTR::null(), None, None, PCSTR(e.as_ptr() as _), PCSTR(t.as_ptr() as _), 0, 0, &mut code, Some(&mut err))
+        D3DCompile(src.as_ptr() as _, src.len(), PCSTR::null(), None, None, PCSTR(e.as_ptr() as _), PCSTR(t.as_ptr() as _), 0, 0, &mut code, Some(&mut err))
     };
     let bytes = |b: &ID3DBlob| unsafe { std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec() };
     match (r, code) {

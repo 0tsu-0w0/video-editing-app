@@ -15,6 +15,7 @@ pub fn command_schema() -> Value {
             "複数のコマンドは 1 回の Undo で戻せる 1 つの操作としてまとめて実行される。1 つでも失敗すると全て取り消される。",
             "映像トラックは、tracks の後ろのものほど手前に重なる。",
             "位置 x, y はピクセル、画面中央が原点、y は下向き。",
+            "3D モデル(type: model)は、拡大率 1 で画面の高さの約 8 割に収まる大きさで描かれる。rot_y で左右に向きを変え、rot_x で前後に傾ける(度)。rotation は画面上の回転。",
         ],
         "params": PARAMS.iter().map(|(n, lo, hi)| json!({"name": n, "min": lo, "max": hi})).collect::<Vec<_>>(),
         "commands": [
@@ -43,7 +44,7 @@ pub fn command_schema() -> Value {
                 "clip": "クリップ ID", "fade_in": "(任意)秒", "fade_out": "(任意)秒"}},
             {"command": "set_pin", "description": "クリップの素材の四隅を画面上の位置に合わせて変形する(壁や机などの平面に貼る)。keys が空なら外す。四隅がある間は x / y / scale / rotation は使われない", "args": {
                 "clip": "クリップ ID", "keys": "[{\"time\": クリップ開始からの秒, \"corners\": [[左上x,左上y],[右上x,右上y],[右下x,右下y],[左下x,左下y]]}, ...](位置は画面中央が原点のピクセル。キーの間は直線で補間)"}},
-            {"command": "import_asset", "description": "文字の素材を作る(動画・画像のファイルは import_file ツールで読み込む)。作った素材は add_clip で映像トラックに置く", "args": {
+            {"command": "import_asset", "description": "文字の素材を作る(動画・画像・3D モデルのファイルは import_file ツールで読み込む)。作った素材は add_clip で映像トラックに置く", "args": {
                 "name": "素材名", "path": "\"\"(空文字)",
                 "kind": "{\"type\": \"text\", \"text\": \"表示する文字(改行は \n)\", \"style\": {\"font\":\"meiryo\",\"size\":72,\"color\":\"#FFFFFF\",\"outline\":6,\"outline_color\":\"#000000\",\"align\":\"center\"}}(style は任意)"}},
             {"command": "set_text", "description": "文字の素材の内容・見た目を変える(省略した項目はそのまま)", "args": {
@@ -96,6 +97,10 @@ pub fn describe(p: &Project) -> Value {
                     v["text"] = json!(text);
                     v["style"] = json!(style);
                 }
+                AssetKind::Model { animation } => {
+                    v["type"] = json!("model");
+                    v["animation"] = json!(animation);
+                }
             }
             v
         })
@@ -110,9 +115,11 @@ pub fn describe(p: &Project) -> Value {
                 .iter()
                 .map(|c| {
                     let mut params = serde_json::Map::new();
+                    let is_model = matches!(p.assets.get(&c.asset).map(|a| &a.kind), Some(AssetKind::Model { .. }));
                     for (name, _, _) in PARAMS {
                         let pr = c.params.get(name).unwrap();
                         let relevant = match t.kind {
+                            TrackKind::Video if matches!(name, "rot_x" | "rot_y") => is_model,
                             TrackKind::Video => !matches!(name, "volume" | "pan"),
                             TrackKind::Audio => matches!(name, "volume" | "pan"),
                         };
