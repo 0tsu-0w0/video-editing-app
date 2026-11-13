@@ -2275,7 +2275,9 @@ dependencies = [
  "egui",
  "egui-directx11",
  "egui-winit",
+ "image",
  "rfd",
+ "serde",
  "serde_json",
  "studio-core",
  "studio-media",
@@ -2291,6 +2293,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "studio-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

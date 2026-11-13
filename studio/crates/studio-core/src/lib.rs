@@ -6,6 +6,7 @@
 //! - `editor`: 実行・トランザクション・試し実行・Undo/Redo
 //! - `eval`: ある時刻に描く映像レイヤーと鳴らす音声
 
+pub mod ai;
 pub mod command;
 pub mod editor;
 pub mod eval;

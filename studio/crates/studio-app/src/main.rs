@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod control;
 mod timeline;
 
 use audio::AudioEngine;
@@ -11,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use studio_core::command::Command::*;
 use studio_core::project::PARAMS;
+use serde_json::{json, Value};
+use std::collections::VecDeque;
 use studio_core::{AssetKind, Command, Editor, Id, Origin, Project, Time, TrackKind};
 use studio_render::gpu::Gpu;
 use studio_render::Renderer;
@@ -27,6 +30,37 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const PROJECT_EXT: &str = "fsproj";
+
+/// Claude など外部(MCP)からの操作をどこまで許すか。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum McpMode {
+    ReadOnly,
+    Ask,
+    Auto,
+}
+
+impl McpMode {
+    fn label(self) -> &'static str {
+        match self {
+            McpMode::ReadOnly => "閲覧のみ",
+            McpMode::Ask => "編集は確認する",
+            McpMode::Auto => "自動で実行",
+        }
+    }
+}
+
+/// 利用者の承認を待っている外部からの操作。
+struct Pending {
+    title: String,
+    summary: Vec<String>,
+    action: PendingAction,
+    reply: std::sync::mpsc::Sender<Result<Value, String>>,
+}
+
+enum PendingAction {
+    Commands { label: String, commands: Vec<Command> },
+    Export(PathBuf),
+}
 
 /// 書き出しの進み具合(別スレッドと共有)。
 struct ExportJob {
@@ -51,10 +85,13 @@ struct Studio {
     /// スライダーを操作中の値(手を離したときに 1 つのコマンドにする)
     editing: Option<(Id, String, f64)>,
     last_project: Option<Arc<Project>>,
+    control: Option<control::ControlServer>,
+    mcp_mode: McpMode,
+    pending: VecDeque<Pending>,
 }
 
 impl Studio {
-    fn new(gpu: Gpu) -> Self {
+    fn new(gpu: Gpu, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let mut editor = Editor::new(Project::default());
         editor
             .transaction(
@@ -69,7 +106,17 @@ impl Studio {
             .unwrap();
         editor.dirty = false;
         let audio = AudioEngine::new(Arc::new(editor.project.clone()));
-        let status = format!("音声出力: {}", audio.device_name);
+        let control = control::start(wake).ok();
+        let status = format!(
+            "音声出力: {} / 外部からの操作の受付: {}",
+            audio.device_name,
+            control.as_ref().map(|c| format!("127.0.0.1:{}", c.port)).unwrap_or("開始できませんでした".into())
+        );
+        let mcp_mode = match std::env::var("STUDIO_MCP_MODE").as_deref() {
+            Ok("auto") => McpMode::Auto,
+            Ok("readonly") => McpMode::ReadOnly,
+            _ => McpMode::Ask,
+        };
         Self {
             editor,
             path: None,
@@ -83,6 +130,9 @@ impl Studio {
             export: None,
             editing: None,
             last_project: None,
+            control,
+            mcp_mode,
+            pending: VecDeque::new(),
         }
     }
 
@@ -208,6 +258,13 @@ impl Studio {
             return;
         }
         let Some(path) = rfd::FileDialog::new().add_filter("MP4 動画", &["mp4"]).set_file_name("output.mp4").save_file() else { return };
+        self.start_export_to(path);
+    }
+
+    fn start_export_to(&mut self, path: PathBuf) {
+        if self.export.is_some() {
+            return;
+        }
         let project = self.editor.project.clone();
         let job = ExportJob {
             done: Arc::new(AtomicI64::new(0)),
@@ -226,6 +283,200 @@ impl Studio {
             *result.lock().unwrap() = Some(r);
         });
         self.export = Some(job);
+    }
+
+    /// 外部(MCP)からの要求を処理する。編集は権限に従って、すぐ実行するか承認待ちにする。
+    fn process_requests(&mut self) {
+        let mut reqs = vec![];
+        if let Some(c) = &self.control {
+            while let Ok(r) = c.rx.try_recv() {
+                reqs.push(r);
+            }
+        }
+        for r in reqs {
+            let result = self.handle_request(&r.method, &r.params);
+            match result {
+                Handled::Done(v) => {
+                    let _ = r.reply.send(v);
+                }
+                Handled::NeedsApproval(title, summary, action) => {
+                    self.pending.push_back(Pending { title, summary, action, reply: r.reply });
+                }
+            }
+        }
+    }
+
+    fn handle_request(&mut self, method: &str, params: &Value) -> Handled {
+        use Handled::Done;
+        let p = &self.editor.project;
+        match method {
+            "get_project" => Done(Ok(studio_core::ai::describe(p))),
+            "get_command_schema" => Done(Ok(studio_core::ai::command_schema())),
+            "get_state" => Done(Ok(json!({
+                "playhead": (self.playhead.secs_f64() * 1000.0).round() / 1000.0,
+                "playing": self.audio.is_playing(),
+                "selected_clip": self.selected.map(|i| i.0),
+                "duration": (p.duration().secs_f64() * 1000.0).round() / 1000.0,
+                "project_file": self.path.as_ref().map(|x| x.to_string_lossy().to_string()),
+                "unsaved_changes": self.editor.dirty,
+                "permission": self.mcp_mode.label(),
+                "can_undo": self.editor.can_undo(),
+                "exporting": self.export.is_some(),
+            }))),
+            "seek" => match params.get("time").cloned().map(serde_json::from_value::<TimeArg>) {
+                Some(Ok(t)) => {
+                    self.seek(t.0);
+                    Done(Ok(json!({"playhead": t.0.secs_f64()})))
+                }
+                _ => Done(Err("time(秒、または \"00:00:01.500\")を指定してください".into())),
+            },
+            "play" => {
+                if !self.audio.is_playing() {
+                    self.toggle_play();
+                }
+                Done(Ok(json!("再生しました")))
+            }
+            "stop" => {
+                if self.audio.is_playing() {
+                    self.toggle_play();
+                }
+                Done(Ok(json!({"playhead": self.playhead.secs_f64()})))
+            }
+            "undo" | "redo" => {
+                if self.mcp_mode == McpMode::ReadOnly {
+                    return Done(Err("閲覧のみの設定です。アプリ上部の「外部からの操作」で変更できます".into()));
+                }
+                let r = if method == "undo" { self.editor.undo() } else { self.editor.redo() };
+                Done(r.map(|l| json!(format!("{l} を{}", if method == "undo" { "元に戻しました" } else { "やり直しました" }))).ok_or("戻せる操作がありません".into()))
+            }
+            "render_frame" => {
+                let t = params.get("time").cloned().and_then(|v| serde_json::from_value::<TimeArg>(v).ok()).map(|t| t.0).unwrap_or(self.playhead);
+                let width = params.get("width").and_then(|w| w.as_u64()).unwrap_or(640).clamp(64, 1920) as u32;
+                Done(self.frame_png(t, width).map(|b64| json!({"png_base64": b64, "time": t.secs_f64()})))
+            }
+            "execute" | "import_file" => {
+                let (label, commands) = if method == "import_file" {
+                    let Some(path) = params.get("path").and_then(|x| x.as_str()) else { return Done(Err("path を指定してください".into())) };
+                    let path = PathBuf::from(path);
+                    let kind = match studio_media::probe(&path) {
+                        Ok(k) => k,
+                        Err(e) => return Done(Err(e.to_string())),
+                    };
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    ("素材の読み込み".to_string(), vec![Command::ImportAsset { name, path: path.to_string_lossy().into(), kind, id: None }])
+                } else {
+                    let cmds = match params.get("commands").cloned().map(serde_json::from_value::<Vec<Command>>) {
+                        Some(Ok(c)) if !c.is_empty() => c,
+                        Some(Err(e)) => return Done(Err(format!("commands を読めません: {e}。get_command_schema で書式を確認してください"))),
+                        _ => return Done(Err("commands(コマンドの配列)を指定してください".into())),
+                    };
+                    let label = params.get("label").and_then(|l| l.as_str()).unwrap_or("Claude の操作").chars().take(60).collect();
+                    (label, cmds)
+                };
+                // まず試し実行(失敗ならその理由をすぐ返す)
+                let summary = match self.editor.dry_run(&commands) {
+                    Ok(o) => o.summary,
+                    Err(e) => return Done(Err(e.to_string())),
+                };
+                if params.get("dry_run").and_then(|d| d.as_bool()) == Some(true) {
+                    return Done(Ok(json!({"dry_run": true, "summary": summary})));
+                }
+                match self.mcp_mode {
+                    McpMode::ReadOnly => Done(Err("閲覧のみの設定です。アプリ上部の「外部からの操作」で変更できます".into())),
+                    McpMode::Ask => Handled::NeedsApproval(label.clone(), summary, PendingAction::Commands { label, commands }),
+                    McpMode::Auto => Done(self.apply_external(&label, commands)),
+                }
+            }
+            "export" => {
+                let Some(path) = params.get("path").and_then(|x| x.as_str()) else { return Done(Err("path を指定してください".into())) };
+                if !path.to_ascii_lowercase().ends_with(".mp4") {
+                    return Done(Err("書き出し先は .mp4 にしてください".into()));
+                }
+                if self.export.is_some() {
+                    return Done(Err("書き出し中です".into()));
+                }
+                let path = PathBuf::from(path);
+                let mut summary = vec![format!("書き出し先: {}", path.display())];
+                if path.exists() {
+                    summary.push("このファイルは既にあり、上書きされます".into());
+                }
+                // ファイルを書くので、権限の設定に関わらず必ず確認する
+                Handled::NeedsApproval("動画の書き出し".into(), summary, PendingAction::Export(path))
+            }
+            "export_status" => Done(Ok(match &self.export {
+                Some(j) => json!({"exporting": true, "done": j.done.load(Ordering::Relaxed), "total": j.total.load(Ordering::Relaxed)}),
+                None => json!({"exporting": false, "last_status": self.status}),
+            })),
+            _ => Done(Err(format!("知らない操作です: {method}"))),
+        }
+    }
+
+    fn apply_external(&mut self, label: &str, commands: Vec<Command>) -> Result<Value, String> {
+        match self.editor.transaction(label, commands, Origin::Mcp) {
+            Ok(o) => {
+                self.status = format!("Claude: {}", o.summary.join(" / "));
+                Ok(json!({"created_ids": o.created.iter().map(|i| i.0).collect::<Vec<_>>(), "summary": o.summary}))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn frame_png(&mut self, t: Time, width: u32) -> Result<String, String> {
+        let p = self.editor.project.clone();
+        let bgra = self.renderer.render_bgra(&p, t)?;
+        let (w, h) = (p.settings.width, p.settings.height);
+        let mut rgba = bgra;
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        let img = image::RgbaImage::from_raw(w, h, rgba).ok_or("画像を作れません")?;
+        let height = ((h as f64 * width as f64 / w as f64).round() as u32).max(1);
+        let small = image::imageops::resize(&img, width, height, image::imageops::FilterType::Triangle);
+        let mut png = std::io::Cursor::new(Vec::new());
+        small.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        Ok(control::base64(png.get_ref()))
+    }
+
+    /// 承認待ちの操作を、1 件ずつ画面に出す。
+    fn approval_window(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.pending.front() else { return };
+        let mut decision = None;
+        egui::Window::new("Claude からの操作の確認").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.label(egui::RichText::new(&p.title).strong());
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for s in &p.summary {
+                    ui.label(format!("・{s}"));
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("実行する").clicked() {
+                    decision = Some(true);
+                }
+                if ui.button("拒否する").clicked() {
+                    decision = Some(false);
+                }
+                if self.pending.len() > 1 {
+                    ui.weak(format!("ほか {} 件が待っています", self.pending.len() - 1));
+                }
+            });
+        });
+        if let Some(ok) = decision {
+            let p = self.pending.pop_front().unwrap();
+            let r = if !ok {
+                Err("利用者が拒否しました".to_string())
+            } else {
+                match p.action {
+                    PendingAction::Commands { label, commands } => self.apply_external(&label, commands),
+                    PendingAction::Export(path) => {
+                        self.start_export_to(path.clone());
+                        Ok(json!(format!("書き出しを開始しました: {}。export_status で進み具合を確認できます", path.display())))
+                    }
+                }
+            };
+            let _ = p.reply.send(r);
+        }
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -296,7 +547,11 @@ impl Studio {
             }
             ctx.request_repaint();
         }
-        self.handle_keys(&ctx);
+        self.process_requests();
+        self.approval_window(&ctx);
+        if self.pending.is_empty() {
+            self.handle_keys(&ctx);
+        }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if !dropped.is_empty() {
             self.import_files(dropped);
@@ -340,6 +595,13 @@ impl Studio {
                 if ui.add_enabled(self.export.is_none(), egui::Button::new("書き出し")).clicked() {
                     self.start_export();
                 }
+                ui.separator();
+                ui.label("外部からの操作:");
+                egui::ComboBox::from_id_salt("mcp_mode").selected_text(self.mcp_mode.label()).show_ui(ui, |ui| {
+                    for m in [McpMode::ReadOnly, McpMode::Ask, McpMode::Auto] {
+                        ui.selectable_value(&mut self.mcp_mode, m, m.label());
+                    }
+                });
             });
         });
 
@@ -550,6 +812,19 @@ impl Studio {
     }
 }
 
+enum Handled {
+    Done(Result<Value, String>),
+    NeedsApproval(String, Vec<String>, PendingAction),
+}
+
+/// 外部から受け取る時刻(秒の数値、または文字列)。
+struct TimeArg(Time);
+impl<'de> serde::Deserialize<'de> for TimeArg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        studio_core::command::secs::deserialize(d).map(TimeArg)
+    }
+}
+
 trait RawPtr {
     fn as_raw_ptr(&self) -> usize;
 }
@@ -593,7 +868,7 @@ struct App {
 }
 
 impl App {
-    fn new(window: &Window) -> Self {
+    fn new(window: &Window, proxy: winit::event_loop::EventLoopProxy<()>) -> Self {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let RawWindowHandle::Win32(h) = window.window_handle().unwrap().as_raw() else { panic!("Win32 のウィンドウではありません") };
         let hwnd = HWND(h.hwnd.get() as _);
@@ -624,7 +899,9 @@ impl App {
         let winit_state = egui_winit::State::new(egui_ctx.clone(), egui_ctx.viewport_id(), &window, None, None, None);
         let gpu = Gpu::new(Some((device.clone(), ctx.clone()))).expect("描画の初期化に失敗");
         let rtv = Some(Self::make_rtv(&device, &swap));
-        let mut studio = Studio::new(gpu);
+        let mut studio = Studio::new(gpu, move || {
+            let _ = proxy.send_event(());
+        });
         // 起動時に渡されたファイル: プロジェクトなら開き、素材なら読み込んで順に並べる
         for arg in std::env::args_os().skip(1).map(PathBuf::from) {
             if arg.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXT)) {
@@ -702,17 +979,24 @@ impl App {
 struct Runner {
     window: Option<Window>,
     app: Option<App>,
+    proxy: winit::event_loop::EventLoopProxy<()>,
 }
 
-impl ApplicationHandler for Runner {
+impl ApplicationHandler<()> for Runner {
+    /// 外部からの要求が届いたら、画面を更新して処理する
+    fn user_event(&mut self, _el: &ActiveEventLoop, _e: ()) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let w = el.create_window(WindowAttributes::default().with_title("Forge Studio").with_inner_size(PhysicalSize::new(1600, 960))).unwrap();
-        self.app = Some(App::new(&w));
+        self.app = Some(App::new(&w, self.proxy.clone()));
         self.window = Some(w);
     }
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
         if let (Some(w), Some(app)) = (&self.window, &self.app) {
-            if app.studio.audio.is_playing() || app.studio.export.is_some() {
+            if app.studio.audio.is_playing() || app.studio.export.is_some() || !app.studio.pending.is_empty() {
                 w.request_redraw();
             }
         }
@@ -746,6 +1030,7 @@ impl ApplicationHandler for Runner {
 
 fn main() {
     // Media Foundation の初期化は、素材を開くときに各スレッドで行う(UI スレッドはウィンドウ側が先に初期化する)
-    let mut r = Runner { window: None, app: None };
-    EventLoop::new().unwrap().run_app(&mut r).unwrap();
+    let el = EventLoop::<()>::with_user_event().build().unwrap();
+    let mut r = Runner { window: None, app: None, proxy: el.create_proxy() };
+    el.run_app(&mut r).unwrap();
 }
