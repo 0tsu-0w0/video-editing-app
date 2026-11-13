@@ -1,0 +1,19 @@
+[package]
+name = "studio-media"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+thiserror = "2"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+]
