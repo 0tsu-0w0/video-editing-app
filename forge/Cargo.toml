@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/forge-core", "crates/forge-gpu", "crates/forge-cli", "crates/forge-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+opt-level = 1

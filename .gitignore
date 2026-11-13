@@ -1,0 +1,10 @@
+# ビルド成果物
+target/
+*.exe
+*.pdb
+forge/bin/
+forge/out/
+studio-spikes/out/
+studio-spikes/spv/
+# 生成できる大きなファイル(make_gltf.py で再生成)
+studio-spikes/assets/bend_heavy.gltf

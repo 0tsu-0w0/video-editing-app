@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.0",
+  "meta": {
+    "name": "2パスぼかし",
+    "description": "横と縦の2パスでぼかす",
+    "tags": [
+      "blur"
+    ]
+  },
+  "parameters": [
+    {
+      "id": "radius",
+      "label": "範囲",
+      "type": "float",
+      "default": 12,
+      "min": 0,
+      "max": 100,
+      "step": 0.1
+    }
+  ],
+  "shaders": [
+    {
+      "name": "blur_h",
+      "code": "float4 blur_h(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {\n\tfloat4 s = 0;\n\tfloat wsum = 0;\n\tfor (int i = -16; i <= 16; i++) {\n\t\tfloat w = exp(-(i * i) / 72.0);\n\t\ts += tex0.Sample(smp, uv + float2(i * radius / 16.0, 0) / resolution) * w;\n\t\twsum += w;\n\t}\n\treturn s / wsum;\n}"
+    },
+    {
+      "name": "blur_v",
+      "code": "float4 blur_v(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {\n\tfloat4 s = 0;\n\tfloat wsum = 0;\n\tfor (int i = -16; i <= 16; i++) {\n\t\tfloat w = exp(-(i * i) / 72.0);\n\t\ts += tex0.Sample(smp, uv + float2(0, i * radius / 16.0) / resolution) * w;\n\t\twsum += w;\n\t}\n\treturn s / wsum;\n}"
+    }
+  ],
+  "passes": [
+    {
+      "shader": "blur_h",
+      "target": "tempbuffer",
+      "resources": [
+        "object"
+      ],
+      "sampler": "clamp"
+    },
+    {
+      "shader": "blur_v",
+      "target": "object",
+      "resources": [
+        "tempbuffer"
+      ],
+      "sampler": "clamp"
+    }
+  ]
+}

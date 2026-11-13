@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "meta": {
+    "name": "色反転",
+    "description": "色を反転する",
+    "tags": [
+      "color"
+    ]
+  },
+  "parameters": [
+    {
+      "id": "amount",
+      "label": "強さ",
+      "type": "float",
+      "default": 1,
+      "min": 0,
+      "max": 1,
+      "step": 0.01
+    }
+  ],
+  "shaders": [
+    {
+      "name": "psmain",
+      "code": "float4 psmain(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {\n\tfloat4 c = tex0.Sample(smp, uv);\n\tfloat a = max(c.a, 1e-5);\n\tfloat3 rgb = c.rgb / a;\n\trgb = lerp(rgb, 1.0 - rgb, amount);\n\treturn float4(rgb * c.a, c.a);\n}"
+    }
+  ],
+  "passes": [
+    {
+      "shader": "psmain",
+      "target": "object",
+      "resources": [
+        "object"
+      ]
+    }
+  ]
+}

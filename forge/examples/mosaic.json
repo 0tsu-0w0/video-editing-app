@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "meta": {
+    "name": "モザイク簡易",
+    "description": "ブロック状に粗くする",
+    "tags": [
+      "mosaic"
+    ]
+  },
+  "parameters": [
+    {
+      "id": "size",
+      "label": "サイズ",
+      "type": "int",
+      "default": 16,
+      "min": 1,
+      "max": 256
+    }
+  ],
+  "shaders": [
+    {
+      "name": "psmain",
+      "code": "float4 psmain(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {\n\tfloat2 cell = max(size, 1.0);\n\tfloat2 p = (floor(pos.xy / cell) + 0.5) * cell;\n\treturn tex0.Sample(smp, clamp(p, 0.5, resolution - 0.5) / resolution);\n}"
+    }
+  ],
+  "passes": [
+    {
+      "shader": "psmain",
+      "target": "object",
+      "resources": [
+        "object"
+      ],
+      "sampler": "clamp"
+    }
+  ]
+}

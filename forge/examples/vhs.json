@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "meta": {
+    "name": "VHSノイズ",
+    "description": "走査線ノイズと色ズレでVHS風にする",
+    "tags": [
+      "noise",
+      "retro"
+    ]
+  },
+  "parameters": [
+    {
+      "id": "noise_intensity",
+      "label": "ノイズ強度",
+      "type": "float",
+      "default": 0.25,
+      "min": 0,
+      "max": 1,
+      "step": 0.01
+    },
+    {
+      "id": "color_shift",
+      "label": "色ズレ量",
+      "type": "float",
+      "default": 6,
+      "min": 0,
+      "max": 64,
+      "step": 0.1
+    },
+    {
+      "id": "jitter",
+      "label": "横ブレ",
+      "type": "float",
+      "default": 3,
+      "min": 0,
+      "max": 50,
+      "step": 0.1
+    },
+    {
+      "id": "scanlines",
+      "label": "走査線",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "id": "tint",
+      "label": "色味",
+      "type": "color",
+      "default": "#FFE8D0"
+    },
+    {
+      "id": "grain",
+      "label": "ノイズ種類",
+      "type": "select",
+      "options": [
+        "細かい",
+        "粗い"
+      ],
+      "default": 0
+    }
+  ],
+  "shaders": [
+    {
+      "name": "psmain",
+      "code": "float fg_hash(float2 p) {\n\t// tex1 = random (256x256, r only)\n\treturn tex1.SampleLevel(smp, p / 256.0, 0).r;\n}\nfloat4 psmain(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {\n\tfloat t = floor(time * 30.0);\n\tfloat cell = lerp(1.0, 4.0, grain);\n\tfloat line_n = fg_hash(float2(floor(pos.y / 2.0) + seed, t)) - 0.5;\n\tfloat2 ofs = float2(line_n * jitter, 0.0) / resolution;\n\tfloat2 sh = float2(color_shift, 0.0) / resolution;\n\tfloat4 cr = tex0.Sample(smp, uv + ofs + sh);\n\tfloat4 cg = tex0.Sample(smp, uv + ofs);\n\tfloat4 cb = tex0.Sample(smp, uv + ofs - sh);\n\tfloat a = max(max(cr.a, cg.a), cb.a);\n\tfloat3 rgb = float3(cr.r, cg.g, cb.b);\n\tfloat n = fg_hash(floor(pos.xy / cell) + float2(t * 17.0, t * 31.0 + seed)) - 0.5;\n\trgb += n * noise_intensity * a;\n\tif (scanlines > 0.5) {\n\t\trgb *= 0.85 + 0.15 * sin(pos.y * 3.14159265);\n\t}\n\trgb *= tint;\n\trgb = clamp(rgb, 0.0, a);\n\treturn float4(rgb, a);\n}"
+    }
+  ],
+  "passes": [
+    {
+      "shader": "psmain",
+      "target": "object",
+      "resources": [
+        "object",
+        "random"
+      ],
+      "sampler": "loop"
+    }
+  ]
+}
