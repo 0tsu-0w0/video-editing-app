@@ -68,6 +68,24 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         locked: Option<bool>,
     },
+    /// 音声トラックの音量(dB)・左右のバランス・ソロ(省略した項目はそのまま)
+    SetTrackAudio {
+        track: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gain_db: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pan: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        solo: Option<bool>,
+    },
+    /// 音声トラックのエフェクトを、この並びに置き換える
+    SetTrackEffects {
+        track: Id,
+        #[serde(default)]
+        effects: Vec<AudioEffect>,
+    },
+    /// 全体の音量(dB)
+    SetMasterGain { gain_db: f64 },
 
     // ---- 素材
     ImportAsset {
@@ -215,6 +233,9 @@ impl Command {
             Command::RenameTrack { .. } => "rename_track",
             Command::MoveTrack { .. } => "move_track",
             Command::SetTrackFlags { .. } => "set_track_flags",
+            Command::SetTrackAudio { .. } => "set_track_audio",
+            Command::SetTrackEffects { .. } => "set_track_effects",
+            Command::SetMasterGain { .. } => "set_master_gain",
             Command::ImportAsset { .. } => "import_asset",
             Command::RemoveAsset { .. } => "remove_asset",
             Command::AddClip { .. } => "add_clip",
@@ -360,7 +381,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             let id = take_id(p, id)?;
             let n = p.tracks.iter().filter(|t| t.kind == kind).count() + 1;
             let name = name.unwrap_or_else(|| format!("{}{}", if kind == TrackKind::Video { "映像" } else { "音声" }, n));
-            p.tracks.insert(index, Track { id, kind, name: name.clone(), muted: false, locked: false, clips: vec![] });
+            p.tracks.insert(index, Track { id, kind, name: name.clone(), muted: false, locked: false, clips: vec![], audio: Default::default() });
             done(vec![RemoveTrack { track: id }], AddTrack { kind, name: Some(name.clone()), index: Some(index), id: Some(id) }, Some(id), format!("トラック「{name}」({id})を追加"))
         }
         RemoveTrack { track } => {
@@ -674,6 +695,58 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 slot.value = removed.value;
             }
             done(vec![RestoreParam { clip, param: param.clone(), state: old }], cmd.clone(), None, format!("クリップ {clip} の {param} のキー({time})を削除"))
+        }
+        SetTrackAudio { track, gain_db, pan, solo } => {
+            let t = track_mut(p, track)?;
+            if t.kind != TrackKind::Audio {
+                return err("invalid", format!("トラック {track} は音声トラックではありません"));
+            }
+            if gain_db.is_some_and(|g| !g.is_finite() || !(-60.0..=12.0).contains(&g)) {
+                return err("out_of_range", "gain_db は -60〜12 にしてください");
+            }
+            if pan.is_some_and(|v| !v.is_finite() || !(-1.0..=1.0).contains(&v)) {
+                return err("out_of_range", "pan は -1〜1 にしてください");
+            }
+            let a = &mut t.audio;
+            let inv = SetTrackAudio { track, gain_db: gain_db.map(|_| a.gain_db), pan: pan.map(|_| a.pan), solo: solo.map(|_| a.solo) };
+            if let Some(v) = gain_db {
+                a.gain_db = v;
+            }
+            if let Some(v) = pan {
+                a.pan = v;
+            }
+            if let Some(v) = solo {
+                a.solo = v;
+            }
+            done(vec![inv], cmd.clone(), None, format!("トラック {track} の音量 {:.1}dB・バランス {:.2}{}", a.gain_db, a.pan, if a.solo { "・ソロ" } else { "" }))
+        }
+        SetTrackEffects { track, effects } => {
+            let audio_tracks: Vec<Id> = p.tracks.iter().filter(|t| t.kind == TrackKind::Audio).map(|t| t.id).collect();
+            if effects.len() > 16 {
+                return err("invalid", "エフェクトは 16 個までです");
+            }
+            for (i, e) in effects.iter().enumerate() {
+                e.check().map_err(|m| EditError { code: "out_of_range", message: format!("エフェクト {i}: {m}") })?;
+                if let AudioEffect::Duck { source, .. } = e {
+                    if *source == track || !audio_tracks.contains(source) {
+                        return err("invalid", format!("エフェクト {i}: ダッキングの source には、別の音声トラックの ID を指定してください"));
+                    }
+                }
+            }
+            let t = track_mut(p, track)?;
+            if t.kind != TrackKind::Audio {
+                return err("invalid", format!("トラック {track} は音声トラックではありません"));
+            }
+            let old = std::mem::replace(&mut t.audio.effects, effects);
+            let n = t.audio.effects.len();
+            done(vec![SetTrackEffects { track, effects: old }], cmd.clone(), None, format!("トラック {track} のエフェクトを {n} 個に設定"))
+        }
+        SetMasterGain { gain_db } => {
+            if !gain_db.is_finite() || !(-60.0..=12.0).contains(&gain_db) {
+                return err("out_of_range", "gain_db は -60〜12 にしてください");
+            }
+            let old = std::mem::replace(&mut p.settings.master_gain_db, gain_db);
+            done(vec![SetMasterGain { gain_db: old }], cmd.clone(), None, format!("全体の音量を {gain_db:.1}dB に設定"))
         }
         SetSettings { width, height, frame_rate, sample_rate } => {
             let s = &mut p.settings;

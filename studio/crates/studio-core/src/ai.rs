@@ -44,6 +44,12 @@ pub fn command_schema() -> Value {
                 "clip": "クリップ ID", "fade_in": "(任意)秒", "fade_out": "(任意)秒"}},
             {"command": "set_pin", "description": "クリップの素材の四隅を画面上の位置に合わせて変形する(壁や机などの平面に貼る)。keys が空なら外す。四隅がある間は x / y / scale / rotation は使われない", "args": {
                 "clip": "クリップ ID", "keys": "[{\"time\": クリップ開始からの秒, \"corners\": [[左上x,左上y],[右上x,右上y],[右下x,右下y],[左下x,左下y]]}, ...](位置は画面中央が原点のピクセル。キーの間は直線で補間)"}},
+            {"command": "set_track_audio", "description": "音声トラックのミキサー: 音量(dB)・左右のバランス・ソロ(省略した項目はそのまま)", "args": {
+                "track": "音声トラック ID", "gain_db": "(任意)-60〜12。0 で元の音量、-6 で約半分", "pan": "(任意)-1(左)〜1(右)", "solo": "(任意)true なら、ソロのトラックだけ鳴る"}},
+            {"command": "set_track_effects", "description": "音声トラックのエフェクトを、この並び(上から順にかかる)に置き換える。空の配列で全て外す", "args": {
+                "track": "音声トラック ID",
+                "effects": "[{\"type\":\"eq\",\"low_db\":0,\"mid_db\":0,\"high_db\":0}(200Hz/1kHz/5kHz の増減、±24), {\"type\":\"compressor\",\"threshold_db\":-18,\"ratio\":4,\"makeup_db\":3}, {\"type\":\"duck\",\"source\":声のトラック ID,\"amount_db\":-12}(source に音がある間このトラックを下げる。BGM を声の裏で下げるときに BGM のトラックへ付ける)]"}},
+            {"command": "set_master_gain", "description": "全体の音量(dB、-60〜12)", "args": {"gain_db": "数値"}},
             {"command": "import_asset", "description": "文字の素材を作る(動画・画像・3D モデルのファイルは import_file ツールで読み込む)。作った素材は add_clip で映像トラックに置く", "args": {
                 "name": "素材名", "path": "\"\"(空文字)",
                 "kind": "{\"type\": \"text\", \"text\": \"表示する文字(改行は \n)\", \"style\": {\"font\":\"meiryo\",\"size\":72,\"color\":\"#FFFFFF\",\"outline\":6,\"outline_color\":\"#000000\",\"align\":\"center\"}}(style は任意)"}},
@@ -55,6 +61,7 @@ pub fn command_schema() -> Value {
         ],
         "example": [
             {"command": "add_clip", "track": 2, "asset": 5, "start": 3.0, "duration": 4.0},
+            {"command": "set_track_effects", "track": 4, "effects": [{"type": "duck", "source": 3, "amount_db": -12}]},
             {"command": "set_key", "clip": 9, "param": "opacity", "time": 0, "value": 0, "interp": "ease_out"},
             {"command": "set_key", "clip": 9, "param": "opacity", "time": 0.5, "value": 1},
             {"command": "import_asset", "name": "タイトル", "path": "", "kind": {"type": "text", "text": "サンプル", "style": {"size": 96, "outline": 6}}},
@@ -162,13 +169,17 @@ pub fn describe(p: &Project) -> Value {
                     v
                 })
                 .collect();
-            json!({"id": t.id.0, "index": i, "kind": t.kind, "name": t.name, "muted": t.muted, "locked": t.locked, "clips": clips})
+            let mut v = json!({"id": t.id.0, "index": i, "kind": t.kind, "name": t.name, "muted": t.muted, "locked": t.locked, "clips": clips});
+            if t.kind == TrackKind::Audio {
+                v["audio"] = json!(t.audio);
+            }
+            v
         })
         .collect();
     let s = &p.settings;
     json!({
         "settings": {"width": s.width, "height": s.height, "fps": (s.frame_rate.fps() * 1000.0).round() / 1000.0,
-                     "frame_rate": s.frame_rate, "sample_rate": s.sample_rate},
+                     "frame_rate": s.frame_rate, "sample_rate": s.sample_rate, "master_gain_db": s.master_gain_db},
         "duration": r3(p.duration()),
         "assets": assets,
         "tracks": tracks,
@@ -277,7 +288,7 @@ mod tests {
             serde_json::from_value::<Command>(ex.clone()).unwrap();
         }
         let names: Vec<&str> = s["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text"] {
+        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain"] {
             assert!(names.contains(&n), "{n} の説明がない");
         }
         assert!(!names.iter().any(|n| n.starts_with("restore")), "内部用コマンドを公開しない");

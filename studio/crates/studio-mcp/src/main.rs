@@ -24,7 +24,7 @@ fn tools() -> Value {
     json!([
         {"name": "get_project", "description": "プロジェクトの要約(設定・素材・トラック・クリップ・各項目の値やキーフレーム)を返す。ID はここで確認する",
          "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "get_state", "description": "再生位置・再生中か・選択中のクリップ・未保存の変更・操作の権限などを返す",
+        {"name": "get_state", "description": "再生位置・再生中か・選択中のクリップ・未保存の変更・操作の権限、再生中なら音声トラックごとと全体の音量(ピーク dB)を返す",
          "inputSchema": {"type": "object", "properties": {}}},
         {"name": "get_command_schema", "description": "execute_commands で使えるコマンドの一覧・引数・注意点・例を返す",
          "inputSchema": {"type": "object", "properties": {}}},

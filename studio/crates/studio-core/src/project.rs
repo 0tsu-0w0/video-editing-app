@@ -22,11 +22,18 @@ pub struct Settings {
     pub height: u32,
     pub frame_rate: Rate,
     pub sample_rate: u32,
+    /// 全体の音量(dB)
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub master_gain_db: f64,
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { width: 1920, height: 1080, frame_rate: Rate::new(30, 1), sample_rate: 48_000 }
+        Self { width: 1920, height: 1080, frame_rate: Rate::new(30, 1), sample_rate: 48_000, master_gain_db: 0.0 }
     }
 }
 
@@ -151,6 +158,61 @@ pub struct Track {
     /// 開始時刻の順に並ぶ。重なりは無い。
     #[serde(default)]
     pub clips: Vec<Clip>,
+    /// 音声トラックのミキサーの設定
+    #[serde(default, skip_serializing_if = "TrackAudio::is_default")]
+    pub audio: TrackAudio,
+}
+
+/// 音声トラックの音量・定位・ソロ・エフェクト。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrackAudio {
+    /// 音量(dB、-60〜+12。-60 以下は無音)
+    pub gain_db: f64,
+    /// 左右のバランス(-1 = 左、1 = 右)
+    pub pan: f64,
+    /// ソロ(どれかのトラックがソロなら、ソロのトラックだけ鳴る)
+    pub solo: bool,
+    /// エフェクト(上から順にかかる)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<AudioEffect>,
+}
+
+impl TrackAudio {
+    pub fn is_default(&self) -> bool {
+        *self == TrackAudio::default()
+    }
+}
+
+/// 音声トラックのエフェクト。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AudioEffect {
+    /// 3 バンドのイコライザ(低音 200Hz・中音 1kHz・高音 5kHz の増減、dB)
+    Eq { low_db: f64, mid_db: f64, high_db: f64 },
+    /// コンプレッサー(threshold_db を超えた分を 1/ratio に縮め、makeup_db だけ持ち上げる)
+    Compressor { threshold_db: f64, ratio: f64, makeup_db: f64 },
+    /// ダッキング: トラック source に音がある間、このトラックを amount_db だけ下げる(声の裏で BGM を下げる)
+    Duck { source: Id, amount_db: f64 },
+}
+
+impl AudioEffect {
+    pub fn check(&self) -> Result<(), String> {
+        let fin = |v: f64, lo: f64, hi: f64, what: &str| if v.is_finite() && (lo..=hi).contains(&v) { Ok(()) } else { Err(format!("{what} は {lo}〜{hi} にしてください")) };
+        match *self {
+            AudioEffect::Eq { low_db, mid_db, high_db } => {
+                fin(low_db, -24.0, 24.0, "low_db")?;
+                fin(mid_db, -24.0, 24.0, "mid_db")?;
+                fin(high_db, -24.0, 24.0, "high_db")
+            }
+            AudioEffect::Compressor { threshold_db, ratio, makeup_db } => {
+                fin(threshold_db, -60.0, 0.0, "threshold_db")?;
+                fin(ratio, 1.0, 20.0, "ratio")?;
+                fin(makeup_db, 0.0, 24.0, "makeup_db")
+            }
+            AudioEffect::Duck { amount_db, .. } => fin(amount_db, -40.0, 0.0, "amount_db"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -481,6 +543,12 @@ impl Project {
         for t in &self.tracks {
             if !ids.insert(t.id) || t.id.0 >= self.next_id {
                 return Err(format!("トラック {} の ID が不正です", t.id));
+            }
+            for e in &t.audio.effects {
+                e.check().map_err(|m| format!("トラック {} のエフェクト: {m}", t.id))?;
+            }
+            if !t.audio.gain_db.is_finite() || !t.audio.pan.is_finite() {
+                return Err(format!("トラック {} の音量が不正です", t.id));
             }
             for w in t.clips.windows(2) {
                 if w[0].end() > w[1].start {

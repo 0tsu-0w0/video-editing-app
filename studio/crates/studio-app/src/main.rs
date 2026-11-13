@@ -3,6 +3,7 @@
 
 mod audio;
 mod control;
+mod mixer_ui;
 mod timeline;
 
 use audio::AudioEngine;
@@ -114,6 +115,10 @@ struct Studio {
     pick_track: Option<Id>,
     /// プレビューのクリックで四隅を指定中(貼り付けるクリップ、用途、指定済みの点)
     pick_corners: Option<(Id, PinPick, Vec<(f64, f64)>)>,
+    /// ミキサーの窓を出すか
+    show_mixer: bool,
+    /// メーターの表示値(ゆっくり下げる)
+    meters: std::collections::HashMap<u64, (f32, f32)>,
     last_track_result: String,
     /// 言葉での編集(手動ブリッジ)
     ai_instruction: String,
@@ -169,6 +174,8 @@ impl Studio {
             track_job: None,
             pick_track: None,
             pick_corners: None,
+            show_mixer: std::env::var("STUDIO_SHOW_MIXER").is_ok_and(|v| v == "1"),
+            meters: Default::default(),
             last_track_result: String::new(),
             ai_instruction: String::new(),
             ai_reply: String::new(),
@@ -363,6 +370,14 @@ impl Studio {
                 "permission": self.mcp_mode.label(),
                 "can_undo": self.editor.can_undo(),
                 "exporting": self.export.is_some(),
+                // 再生中の音量(ピーク、dB)。音割れの確認やバランス調整に使う
+                "audio_levels_db": self.audio.levels().map(|l| {
+                    let db = |v: f32| (studio_render::audio_fx::gain_to_db(v) * 10.0).round() / 10.0;
+                    json!({
+                        "tracks": l.tracks.iter().map(|(id, a, b)| json!({"track": id.0, "left": db(*a), "right": db(*b)})).collect::<Vec<_>>(),
+                        "master": {"left": db(l.master.0), "right": db(l.master.1)},
+                    })
+                }),
             }))),
             "seek" => match params.get("time").cloned().map(serde_json::from_value::<TimeArg>) {
                 Some(Ok(t)) => {
@@ -843,6 +858,7 @@ impl Studio {
         }
         self.process_requests();
         self.approval_window(&ctx);
+        self.mixer_window(&ctx);
         if self.pending.is_empty() {
             self.handle_keys(&ctx);
         }
@@ -888,6 +904,7 @@ impl Studio {
                 if ui.button("+ 文字").clicked() {
                     self.add_text();
                 }
+                ui.toggle_value(&mut self.show_mixer, "ミキサー");
                 ui.separator();
                 if ui.add_enabled(self.export.is_none(), egui::Button::new("書き出し")).clicked() {
                     self.start_export();

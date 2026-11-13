@@ -348,3 +348,133 @@ fn model_renders_rotates_and_animates() {
     assert!(cya < cym - 10.0, "動いていない: {cym} → {cya}");
     eprintln!("板の幅 {w0}px → 横向き {w90}px、アニメーションで y {cym:.1} → {cya:.1}");
 }
+
+/// 16bit ステレオの WAV。f(秒) が左右に同じ値で入る。
+fn write_wav(path: &Path, secs: f64, f: impl Fn(f64) -> f32) {
+    let rate = 48_000u32;
+    let n = (secs * rate as f64) as u32;
+    let mut d = Vec::new();
+    let data_len = n * 4;
+    d.extend(b"RIFF");
+    d.extend((36 + data_len).to_le_bytes());
+    d.extend(b"WAVEfmt ");
+    d.extend(16u32.to_le_bytes());
+    d.extend(1u16.to_le_bytes());
+    d.extend(2u16.to_le_bytes());
+    d.extend(rate.to_le_bytes());
+    d.extend((rate * 4).to_le_bytes());
+    d.extend(4u16.to_le_bytes());
+    d.extend(16u16.to_le_bytes());
+    d.extend(b"data");
+    d.extend(data_len.to_le_bytes());
+    for i in 0..n {
+        let v = (f(i as f64 / rate as f64).clamp(-1.0, 1.0) * 32767.0) as i16;
+        d.extend(v.to_le_bytes());
+        d.extend(v.to_le_bytes());
+    }
+    std::fs::write(path, d).unwrap();
+}
+
+/// 再生と同じく 1024 標本ずつ続けてミックスした 3 秒分。
+fn mix_all(p: &Project) -> Vec<f32> {
+    let mut m = Mixer::new(48_000);
+    let mut out = vec![];
+    let mut s = 0;
+    while s < 48_000 * 3 {
+        out.extend(m.mix(p, s, 1024));
+        s += 1024;
+    }
+    out
+}
+
+/// 時刻 [a, b) 秒の (左, 右) のピーク。
+fn peak_in(buf: &[f32], a: f64, b: f64) -> (f32, f32) {
+    let (i, j) = ((a * 48_000.0) as usize * 2, (b * 48_000.0) as usize * 2);
+    super::peak(&buf[i..j])
+}
+
+#[test]
+fn mixer_gain_pan_solo_eq_compressor_ducking() {
+    use studio_core::project::AudioEffect;
+    let d = dir();
+    let (voice, bgm) = (d.join("voice.wav"), d.join("bgm.wav"));
+    // 声: 1〜2 秒に 1kHz、BGM: ずっと 200Hz
+    write_wav(&voice, 3.0, |t| if (1.0..2.0).contains(&t) { 0.5 * (t * 1000.0 * std::f64::consts::TAU).sin() as f32 } else { 0.0 });
+    write_wav(&bgm, 3.0, |t| 0.25 * (t * 200.0 * std::f64::consts::TAU).sin() as f32);
+    let mut ed = Editor::new(Project::default());
+    let o = ed
+        .transaction(
+            "準備",
+            vec![
+                AddTrack { kind: TrackKind::Audio, name: Some("声".into()), index: None, id: None },
+                AddTrack { kind: TrackKind::Audio, name: Some("BGM".into()), index: None, id: None },
+                ImportAsset { name: "voice".into(), path: voice.to_string_lossy().into(), kind: studio_media::probe(&voice).unwrap(), id: None },
+                ImportAsset { name: "bgm".into(), path: bgm.to_string_lossy().into(), kind: studio_media::probe(&bgm).unwrap(), id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [tv, tb, av, ab] = o.created[..] else { panic!() };
+    ed.transaction(
+        "配置",
+        vec![
+            AddClip { track: tv, asset: av, start: s(0.0), duration: None, source_in: None, id: None },
+            AddClip { track: tb, asset: ab, start: s(0.0), duration: None, source_in: None, id: None },
+        ],
+        Origin::User,
+    )
+    .unwrap();
+    let near = |a: f32, b: f32, tol: f32| (a - b).abs() <= tol;
+    let base = mix_all(&ed.project);
+    let (v0, b0) = (peak_in(&base, 1.2, 1.8), peak_in(&base, 0.2, 0.8));
+    assert!(near(v0.0, 0.75, 0.03), "声 + BGM の山 {v0:?}");
+    assert!(near(b0.0, 0.25, 0.01), "BGM {b0:?}");
+
+    // 音量 -6dB で約半分、左右のバランスを左いっぱいにすると右は無音
+    ed.execute(SetTrackAudio { track: tb, gain_db: Some(-6.0206), pan: Some(-1.0), solo: None }, Origin::User).unwrap();
+    let m = mix_all(&ed.project);
+    let b = peak_in(&m, 0.2, 0.8);
+    assert!(near(b.0, 0.125, 0.006) && b.1 < 1e-4, "音量・バランス {b:?}");
+    ed.undo();
+
+    // ソロ: 声だけ
+    ed.execute(SetTrackAudio { track: tv, gain_db: None, pan: None, solo: Some(true) }, Origin::User).unwrap();
+    let m = mix_all(&ed.project);
+    assert!(peak_in(&m, 0.2, 0.8).0 < 1e-4, "ソロなのに BGM が鳴っている");
+    ed.undo();
+
+    // イコライザ: 中音(1kHz)を +12dB → 声の 1kHz は約 4 倍(BGM はソロで消して測る)
+    ed.execute(SetTrackAudio { track: tv, gain_db: Some(-20.0), pan: None, solo: Some(true) }, Origin::User).unwrap();
+    let before = peak_in(&mix_all(&ed.project), 1.3, 1.8).0;
+    ed.execute(SetTrackEffects { track: tv, effects: vec![AudioEffect::Eq { low_db: 0.0, mid_db: 12.0, high_db: 0.0 }] }, Origin::User).unwrap();
+    let after = peak_in(&mix_all(&ed.project), 1.3, 1.8).0;
+    assert!(near(after / before, 3.98, 0.15), "EQ の倍率 {}", after / before);
+    // コンプレッサー: -6dB の音を、しきい値 -20dB・4:1 → 超えた 14dB が 3.5dB に(約 -16.5dB = 0.15)
+    ed.execute(SetTrackAudio { track: tv, gain_db: Some(0.0), pan: None, solo: None }, Origin::User).unwrap();
+    ed.execute(SetTrackEffects { track: tv, effects: vec![AudioEffect::Compressor { threshold_db: -20.0, ratio: 4.0, makeup_db: 0.0 }] }, Origin::User).unwrap();
+    let c = peak_in(&mix_all(&ed.project), 1.5, 1.9).0;
+    assert!(near(c, 0.15, 0.02), "コンプレッサー後 {c}");
+    ed.execute(SetTrackEffects { track: tv, effects: vec![] }, Origin::User).unwrap();
+    ed.execute(SetTrackAudio { track: tv, gain_db: None, pan: None, solo: Some(false) }, Origin::User).unwrap();
+
+    // ダッキング: 声が鳴る間 BGM を -12dB。声のトラックを消音しても、きっかけには使える
+    ed.execute(SetTrackEffects { track: tb, effects: vec![AudioEffect::Duck { source: tv, amount_db: -12.0 }] }, Origin::User).unwrap();
+    ed.execute(SetTrackFlags { track: tv, muted: Some(true), locked: None }, Origin::User).unwrap();
+    let mut mx = Mixer::new(48_000);
+    let mut m = vec![];
+    let mut lv = vec![];
+    for k in 0..(48_000 * 3 / 1024) {
+        m.extend(mx.mix(&ed.project, k * 1024, 1024));
+        lv.push(mx.levels.clone());
+    }
+    let (pre, during, post) = (peak_in(&m, 0.5, 0.9).0, peak_in(&m, 1.5, 1.9).0, peak_in(&m, 2.8, 2.95).0);
+    assert!(near(pre, 0.25, 0.01), "前 {pre}");
+    assert!(near(during, 0.25 * 0.251, 0.01), "声の間 {during}");
+    assert!(post > 0.2, "声の後は戻る {post}");
+    // メーター: 消音中の声は 0、BGM は鳴っている
+    let l = &lv[70]; // 約 1.5 秒
+    let get = |id: Id| l.tracks.iter().find(|t| t.0 == id).unwrap();
+    assert_eq!((get(tv).1, get(tv).2), (0.0, 0.0));
+    assert!(get(tb).1 > 0.03 && l.master.0 > 0.03);
+    eprintln!("ダッキング: 前 {pre:.3} → 声の間 {during:.3} → 後 {post:.3} / EQ ×{:.2} / コンプ {c:.3}", after / before);
+}

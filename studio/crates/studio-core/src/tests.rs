@@ -396,3 +396,36 @@ fn corner_pin_interpolates_splits_and_undoes() {
     ed.undo();
     assert!(layers_at(&ed.project, s(2.0))[0].corners.is_some());
 }
+
+#[test]
+fn track_audio_and_effects_validate_and_undo() {
+    let (mut ed, v1, _v2, a1, _movie, _img) = setup();
+    let a2 = ed.execute(AddTrack { kind: TrackKind::Audio, name: None, index: None, id: None }, Origin::User).unwrap().created[0];
+    // 映像トラックには使えない、範囲外は拒否
+    assert!(ed.execute(SetTrackAudio { track: v1, gain_db: Some(-6.0), pan: None, solo: None }, Origin::Ai).is_err());
+    assert!(ed.execute(SetTrackAudio { track: a1, gain_db: Some(30.0), pan: None, solo: None }, Origin::Ai).is_err());
+    ed.execute(SetTrackAudio { track: a1, gain_db: Some(-6.0), pan: Some(0.5), solo: None }, Origin::Ai).unwrap();
+    // JSON(AI の書き方)で、BGM(a2)を声(a1)の裏で下げる
+    let cmds: Vec<Command> = serde_json::from_str(&format!(
+        r#"[{{"command": "set_track_effects", "track": {}, "effects": [{{"type": "eq", "low_db": 3, "mid_db": 0, "high_db": -2}}, {{"type": "duck", "source": {}, "amount_db": -12}}]}}]"#,
+        a2.0, a1.0
+    ))
+    .unwrap();
+    ed.transaction("ダッキング", cmds, Origin::Ai).unwrap();
+    assert_eq!(ed.project.track(a2).unwrap().audio.effects.len(), 2);
+    // 自分自身・映像トラック・範囲外は拒否
+    let duck = |s: Id, a: f64| SetTrackEffects { track: a2, effects: vec![AudioEffect::Duck { source: s, amount_db: a }] };
+    assert!(ed.execute(duck(a2, -12.0), Origin::Ai).is_err());
+    assert!(ed.execute(duck(v1, -12.0), Origin::Ai).is_err());
+    assert!(ed.execute(duck(a1, -80.0), Origin::Ai).is_err());
+    ed.execute(SetMasterGain { gain_db: -3.0 }, Origin::Ai).unwrap();
+    let p2 = Project::from_json(&ed.project.to_json()).unwrap();
+    assert_eq!(p2, ed.project);
+    // 取り消すと元へ
+    ed.undo();
+    assert_eq!(ed.project.settings.master_gain_db, 0.0);
+    ed.undo();
+    assert!(ed.project.track(a2).unwrap().audio.effects.is_empty());
+    ed.undo();
+    assert!(ed.project.track(a1).unwrap().audio.is_default());
+}

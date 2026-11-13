@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use studio_core::time::{sample_to_time, time_to_sample};
 use studio_core::{Project, Time};
-use studio_render::Mixer;
+use studio_render::{Levels, Mixer};
 
 const AHEAD_SECS: f64 = 0.3;
 const CHUNK: usize = 1024;
@@ -30,6 +30,8 @@ struct Shared {
     generation: AtomicU64,
     project: Mutex<Arc<Project>>,
     quit: AtomicBool,
+    /// ミックスした区間ごとの音量(メーター用、古い順)
+    levels: Mutex<VecDeque<Levels>>,
 }
 
 pub struct AudioEngine {
@@ -56,6 +58,7 @@ impl AudioEngine {
             generation: AtomicU64::new(0),
             project: Mutex::new(project),
             quit: AtomicBool::new(false),
+            levels: Mutex::new(VecDeque::new()),
         });
         let mut name = "なし(実時間で再生)".to_string();
         let stream = (|| {
@@ -119,6 +122,7 @@ impl AudioEngine {
                     gen = g;
                     next = sh.start.load(Ordering::Acquire);
                     sh.buf.lock().unwrap().clear();
+                    sh.levels.lock().unwrap().clear();
                 }
                 let buffered = sh.buf.lock().unwrap().len() / 2;
                 if !sh.playing.load(Ordering::Relaxed) || buffered as f64 > AHEAD_SECS * sh.rate as f64 {
@@ -129,6 +133,11 @@ impl AudioEngine {
                 let chunk = mixer.mix(&project, next, CHUNK);
                 if sh.generation.load(Ordering::Acquire) == gen {
                     sh.buf.lock().unwrap().extend(chunk);
+                    let mut lv = sh.levels.lock().unwrap();
+                    lv.push_back(mixer.levels.clone());
+                    while lv.len() > 256 {
+                        lv.pop_front();
+                    }
                     next += CHUNK as i64;
                 }
             }
@@ -158,6 +167,19 @@ impl AudioEngine {
     pub fn stop(&mut self) {
         self.shared.playing.store(false, Ordering::Release);
         self.shared.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// いま耳に届いている音の音量(再生中のみ)。
+    pub fn levels(&self) -> Option<Levels> {
+        if !self.is_playing() {
+            return None;
+        }
+        let pos = time_to_sample(self.position(), self.shared.rate);
+        let mut lv = self.shared.levels.lock().unwrap();
+        while lv.len() > 1 && lv[1].start <= pos {
+            lv.pop_front();
+        }
+        lv.front().filter(|l| l.start <= pos).cloned()
     }
 
     /// いま耳に届いている音の時刻(映像はこれに合わせる)。

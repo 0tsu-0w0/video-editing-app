@@ -57,6 +57,7 @@ pub fn layers_at(p: &Project, t: Time) -> Vec<Layer> {
 /// 区間 [from, to) で鳴る音声の部分。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioSpan {
+    pub track: Id,
     pub clip: Id,
     pub asset: Id,
     /// タイムライン上の区間
@@ -69,15 +70,20 @@ pub struct AudioSpan {
 }
 
 pub fn audio_spans(p: &Project, from: Time, to: Time) -> Vec<AudioSpan> {
+    track_audio_spans(p, from, to, false)
+}
+
+/// 区間 [from, to) で鳴る音声の部分。`with_muted` なら消音中のトラックも含める(ダッキングの判定用)。
+pub fn track_audio_spans(p: &Project, from: Time, to: Time, with_muted: bool) -> Vec<AudioSpan> {
     let mut out = Vec::new();
-    for track in p.tracks.iter().filter(|tr| tr.kind == TrackKind::Audio && !tr.muted) {
+    for track in p.tracks.iter().filter(|tr| tr.kind == TrackKind::Audio && (with_muted || !tr.muted)) {
         for c in &track.clips {
             if c.end() <= from || c.start >= to {
                 continue;
             }
             let s = c.start.max(from);
             let e = c.end().min(to);
-            out.push(AudioSpan { clip: c.id, asset: c.asset, start: s, end: e, source_start: c.source_in + (s - c.start), clip_start: c.start });
+            out.push(AudioSpan { track: track.id, clip: c.id, asset: c.asset, start: s, end: e, source_start: c.source_in + (s - c.start), clip_start: c.start });
         }
     }
     out

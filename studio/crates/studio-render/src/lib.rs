@@ -4,6 +4,7 @@
 //! - `Mixer`: 区間の音声をミックスする(音量・パンのキーフレームを反映)
 //! - `export`: プロジェクト全体を MP4 に書き出す
 
+pub mod audio_fx;
 pub mod gpu;
 pub mod model;
 pub mod text;
@@ -11,9 +12,9 @@ pub mod text;
 use gpu::{Gpu, Placement, Texture};
 use std::collections::HashMap;
 use std::path::Path;
-use studio_core::eval::{audio_spans, layers_at};
+use studio_core::eval::{layers_at, track_audio_spans};
 use studio_core::time::{sample_to_time, time_to_sample};
-use studio_core::{AssetKind, Id, Project, Time};
+use studio_core::{AssetKind, Id, Project, Time, TrackKind};
 use studio_media::{AudioReader, ExportSettings, Exporter, VideoReader};
 
 /// 素材ごとの GPU テクスチャと、映像の読み取り。
@@ -175,22 +176,46 @@ impl Renderer {
     }
 }
 
-/// 音声のミックス。素材ごとに読み取りを持ち、区間の音を足し合わせる。
+/// 直近にミックスした区間の音量(ピーク、直線)。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Levels {
+    /// 区間の始まり(標本)
+    pub start: i64,
+    /// 音声トラックごとの (ID, 左, 右)。鳴っていないトラックは 0
+    pub tracks: Vec<(Id, f32, f32)>,
+    /// 全体(音量調整後、クリップ前)
+    pub master: (f32, f32),
+}
+
+/// 音声のミックス。素材ごとに読み取りを持ち、トラックごとに音を集めてエフェクトをかけ、足し合わせる。
+/// エフェクトの状態は続けて呼ばれる間は引き継ぎ、飛んだ(シークした)ら初めからにする。
 pub struct Mixer {
     rate: u32,
     readers: HashMap<Id, Option<AudioReader>>,
+    fx: HashMap<(Id, usize), audio_fx::FxState>,
+    next: Option<i64>,
+    pub levels: Levels,
+}
+
+fn peak(buf: &[f32]) -> (f32, f32) {
+    buf.chunks_exact(2).fold((0.0f32, 0.0f32), |(l, r), f| (l.max(f[0].abs()), r.max(f[1].abs())))
 }
 
 impl Mixer {
     pub fn new(rate: u32) -> Self {
-        Self { rate, readers: HashMap::new() }
+        Self { rate, readers: HashMap::new(), fx: HashMap::new(), next: None, levels: Levels::default() }
     }
 
     /// 標本番号 start から frames 標本分(ステレオ f32)。
     pub fn mix(&mut self, project: &Project, start: i64, frames: usize) -> Vec<f32> {
-        let mut out = vec![0.0f32; frames * 2];
+        if self.next != Some(start) {
+            self.fx.clear();
+        }
+        self.next = Some(start + frames as i64);
         let (from, to) = (sample_to_time(start, self.rate), sample_to_time(start + frames as i64, self.rate));
-        for span in audio_spans(project, from, to) {
+        // 1. トラックごとに、クリップの音を集める(消音中のトラックも、ダッキングの判定に使うので集める)
+        let mut raw: HashMap<Id, Vec<f32>> = HashMap::new();
+        for span in track_audio_spans(project, from, to, true) {
             let Some(clip) = project.clip(span.clip) else { continue };
             let reader = self.readers.entry(span.asset).or_insert_with(|| {
                 project.assets.get(&span.asset).and_then(|a| AudioReader::open(Path::new(&a.path), self.rate).ok())
@@ -205,6 +230,7 @@ impl Mixer {
             let src_start = time_to_sample(span.source_start, self.rate);
             let Ok(buf) = reader.read(src_start, n) else { continue };
             let off = (s0 - start) as usize;
+            let out = raw.entry(span.track).or_insert_with(|| vec![0.0f32; frames * 2]);
             // 音量とパンは 64 標本ごとに評価し、その間は直線で補間
             let step = 64;
             let gains = |i: usize| {
@@ -223,15 +249,69 @@ impl Mixer {
                 for k in i..j {
                     let f = (k - i) as f32 / (j - i) as f32;
                     let (gl, gr) = (l0 + (l1 - l0) * f, r0 + (r1 - r0) * f);
-                    out[(off + k) * 2] += buf[k * 2] * gl;
-                    out[(off + k) * 2 + 1] += buf[k * 2 + 1] * gr;
+                    if let (Some(o), Some(b)) = (out.get_mut((off + k) * 2..(off + k) * 2 + 2), buf.get(k * 2..k * 2 + 2)) {
+                        o[0] += b[0] * gl;
+                        o[1] += b[1] * gr;
+                    }
                 }
                 i = j;
             }
         }
+        // 2. トラックごとにエフェクト・音量・バランスをかけて足す
+        let any_solo = project.tracks.iter().any(|t| t.kind == TrackKind::Audio && t.audio.solo);
+        let mut out = vec![0.0f32; frames * 2];
+        let mut levels = Levels { start, ..Default::default() };
+        let rate = self.rate as f32;
+        for t in project.tracks.iter().filter(|t| t.kind == TrackKind::Audio) {
+            let audible = !t.muted && (!any_solo || t.audio.solo);
+            let Some(mut b) = raw.get(&t.id).cloned() else {
+                levels.tracks.push((t.id, 0.0, 0.0));
+                continue;
+            };
+            for (i, e) in t.audio.effects.iter().enumerate() {
+                let st = self.fx.entry((t.id, i)).or_insert_with(|| audio_fx::FxState::new(e));
+                if !st.matches(e) {
+                    *st = audio_fx::FxState::new(e);
+                }
+                let side = match e {
+                    studio_core::project::AudioEffect::Duck { source, .. } => Some(raw.get(source).map(|v| v.as_slice()).unwrap_or(&[])),
+                    _ => None,
+                };
+                // 相手が無音の区間も、下げ幅を戻すために無音として処理する
+                let silent;
+                let side = match side {
+                    Some(s) if s.is_empty() => {
+                        silent = vec![0.0f32; frames * 2];
+                        Some(silent.as_slice())
+                    }
+                    other => other,
+                };
+                st.process(e, &mut b, side, rate);
+            }
+            let g = audio_fx::db_to_gain(t.audio.gain_db);
+            let p = t.audio.pan.clamp(-1.0, 1.0) as f32;
+            let (gl, gr) = (g * (1.0 - p).min(1.0), g * (1.0 + p).min(1.0));
+            for f in b.chunks_exact_mut(2) {
+                f[0] *= gl;
+                f[1] *= gr;
+            }
+            let (pl, pr) = if audible { peak(&b) } else { (0.0, 0.0) };
+            levels.tracks.push((t.id, pl, pr));
+            if audible {
+                for (o, v) in out.iter_mut().zip(&b) {
+                    *o += v;
+                }
+            }
+        }
+        let mg = audio_fx::db_to_gain(project.settings.master_gain_db);
+        for v in &mut out {
+            *v *= mg;
+        }
+        levels.master = peak(&out);
         for v in &mut out {
             *v = v.clamp(-1.0, 1.0);
         }
+        self.levels = levels;
         out
     }
 }
