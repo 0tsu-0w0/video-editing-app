@@ -385,6 +385,16 @@ impl Studio {
                     })
                 }),
             }))),
+            "select" => {
+                let clip = params.get("clip").and_then(|c| c.as_u64()).map(Id);
+                if let Some(c) = clip {
+                    if self.editor.project.clip(c).is_none() {
+                        return Done(Err(format!("クリップ {c} はありません")));
+                    }
+                }
+                self.selected = clip;
+                Done(Ok(json!({"selected_clip": clip.map(|c| c.0)})))
+            }
             "seek" => match params.get("time").cloned().map(serde_json::from_value::<TimeArg>) {
                 Some(Ok(t)) => {
                     self.seek(t.0);
@@ -1009,7 +1019,9 @@ impl Studio {
                     }
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 }
-                ui.label(&self.status);
+                if !self.status.is_empty() {
+                    ui.add(egui::Label::new(&self.status).truncate()).on_hover_text(&self.status);
+                }
             });
         });
         self.finish_tracking();
@@ -1044,34 +1056,38 @@ impl Studio {
         });
 
         egui::Panel::left("assets").resizable(true).default_size(220.0).show(ui, |ui| {
-            ui.heading("素材");
-            ui.weak("ファイルをウィンドウにドロップしても読み込めます");
             let mut place = None;
             let mut remove = None;
-            let list_h = (ui.available_height() * 0.45).max(120.0);
-            egui::ScrollArea::vertical().id_salt("asset_list").max_height(list_h).show(ui, |ui| {
-                for a in self.editor.project.assets.values() {
-                    let kind = match &a.kind {
-                        AssetKind::Video { width, height, duration, .. } => format!("動画 {width}×{height} {duration}"),
-                        AssetKind::Audio { duration, .. } => format!("音声 {duration}"),
-                        AssetKind::Image { width, height } => format!("画像 {width}×{height}"),
-                        AssetKind::Model { animation } if *animation > 0.0 => format!("3D モデル(動き {animation:.1} 秒)"),
-                        AssetKind::Model { .. } => "3D モデル".into(),
-                        AssetKind::Text { text, .. } => format!("文字 {}", text.chars().take(16).collect::<String>().replace('\n', " ")),
-                    };
-                    ui.group(|ui| {
-                        ui.label(&a.name);
-                        ui.weak(kind);
-                        ui.horizontal(|ui| {
-                            if ui.small_button("再生位置に置く").clicked() {
-                                place = Some(a.id);
-                            }
-                            if ui.small_button("削除").clicked() {
-                                remove = Some(a.id);
-                            }
+            egui::ScrollArea::vertical().id_salt("left").auto_shrink([false, false]).show(ui, |ui| {
+                egui::CollapsingHeader::new(egui::RichText::new(format!("素材({})", self.editor.project.assets.len())).strong()).default_open(true).show(ui, |ui| {
+                    if self.editor.project.assets.is_empty() {
+                        ui.weak("「素材を読み込む」か、ファイルをウィンドウにドロップしてください");
+                    }
+                    for a in self.editor.project.assets.values() {
+                        let kind = match &a.kind {
+                            AssetKind::Video { width, height, duration, .. } => format!("動画 {width}×{height} {duration}"),
+                            AssetKind::Audio { duration, .. } => format!("音声 {duration}"),
+                            AssetKind::Image { width, height } => format!("画像 {width}×{height}"),
+                            AssetKind::Model { animation } if *animation > 0.0 => format!("3D モデル(動き {animation:.1} 秒)"),
+                            AssetKind::Model { .. } => "3D モデル".into(),
+                            AssetKind::Text { text, .. } => format!("文字 {}", text.chars().take(16).collect::<String>().replace('\n', " ")),
+                        };
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(egui::Label::new(egui::RichText::new(&a.name).strong()).truncate()).on_hover_text(&a.path);
+                            ui.weak(kind);
+                            ui.horizontal(|ui| {
+                                if ui.small_button("再生位置に置く").clicked() {
+                                    place = Some(a.id);
+                                }
+                                if ui.small_button("削除").on_hover_text("プロジェクトから外す(ファイルは消さない)").clicked() {
+                                    remove = Some(a.id);
+                                }
+                            });
                         });
-                    });
-                }
+                    }
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("AI に頼む(言葉で編集)").strong()).default_open(true).show(ui, |ui| self.ai_panel(ui));
             });
             if let Some(a) = place {
                 self.place_asset(a);
@@ -1079,10 +1095,6 @@ impl Studio {
             if let Some(a) = remove {
                 self.run("素材の削除", vec![RemoveAsset { asset: a }]);
             }
-            ui.separator();
-            egui::ScrollArea::vertical().id_salt("ai_panel").show(ui, |ui| {
-                egui::CollapsingHeader::new(egui::RichText::new("AI に頼む(言葉で編集)").strong()).default_open(true).show(ui, |ui| self.ai_panel(ui));
-            });
         });
 
         egui::Panel::right("inspector").resizable(true).default_size(260.0).show(ui, |ui| self.inspector(ui));
@@ -1091,6 +1103,10 @@ impl Studio {
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().id_salt("inspector").auto_shrink([false, false]).show(ui, |ui| self.inspector_body(ui));
+    }
+
+    fn inspector_body(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.selected.filter(|id| self.editor.project.clip(*id).is_some()) else {
             ui.heading("プロジェクト");
             let s = &self.editor.project.settings;
@@ -1105,9 +1121,9 @@ impl Studio {
         };
         let clip = self.editor.project.clip(id).unwrap().clone();
         let asset = self.editor.project.assets.get(&clip.asset).map(|a| a.name.clone()).unwrap_or_default();
-        ui.heading(format!("クリップ {id}"));
-        ui.label(asset);
-        ui.label(format!("{} 〜 {}(長さ {})", clip.start, clip.end(), clip.duration));
+        ui.add(egui::Label::new(egui::RichText::new(asset).heading()).truncate());
+        ui.weak(format!("クリップ {id}  {} 〜 {}", clip.start, clip.end()));
+        ui.weak(format!("長さ {}", clip.duration));
         ui.separator();
         // 文字の内容と見た目
         if let Some(studio_core::Asset { kind: AssetKind::Text { text, style }, .. }) = self.editor.project.assets.get(&clip.asset).cloned() {
@@ -1158,6 +1174,7 @@ impl Studio {
             }
             ui.separator();
         }
+        section(ui, "時間");
         // フェード
         ui.horizontal(|ui| {
             let (mut fi, mut fo) = (clip.fade_in.secs_f64(), clip.fade_out.secs_f64());
@@ -1226,6 +1243,7 @@ impl Studio {
             });
         }
         ui.separator();
+        section(ui, "値(◇ で再生位置にキーフレーム)");
         let local = (self.playhead - clip.start).max(Time::ZERO).min(clip.duration);
         let labels = [
             ("x", "X 位置"),
@@ -1247,48 +1265,66 @@ impl Studio {
         let has_mask = self.editor.project.clip(id).is_some_and(|c| c.mask.is_some());
         let clip = self.editor.project.clip(id).cloned().unwrap_or(clip);
         let is_model = matches!(self.editor.project.assets.get(&clip.asset).map(|a| &a.kind), Some(AssetKind::Model { .. }));
+        let on_audio = self.editor.project.find_clip(id).is_some_and(|(ti, _)| self.editor.project.tracks[ti].kind == TrackKind::Audio);
         let mut commit: Option<Command> = None;
-        for (name, label) in labels {
-            if matches!(name, "rot_x" | "rot_y") && !is_model || name.starts_with("mask_") && !has_mask {
-                continue;
-            }
-            let param = clip.params.get(name).unwrap();
-            let (_, lo, hi) = *PARAMS.iter().find(|p| p.0 == name).unwrap();
-            let range = match name {
-                "x" | "y" => -4000.0..=4000.0,
-                "scale" => 0.0..=8.0,
-                "rotation" | "rot_x" | "rot_y" => -360.0..=360.0,
-                "mask_x" | "mask_y" => -4000.0..=4000.0,
-                "mask_w" | "mask_h" => 0.0..=8000.0,
-                "mask_feather" => 0.0..=400.0,
-                "volume" => 0.0..=4.0,
-                _ => lo..=hi,
-            };
-            let mut v = match &self.editing {
-                Some((c, n, v)) if *c == id && n == name => *v,
-                _ => param.eval(local),
-            };
-            ui.horizontal(|ui| {
-                ui.label(label);
-                let keyed = !param.keys.is_empty();
-                let r = ui.add(egui::Slider::new(&mut v, range).clamping(egui::SliderClamping::Never));
-                if r.changed() {
-                    self.editing = Some((id, name.to_string(), v.clamp(lo, hi)));
+        // 映像トラックでは見た目の項目、音声トラックでは音量・パンだけを出す(列をそろえる)
+        let visible: Vec<(&str, &str)> = labels
+            .into_iter()
+            .filter(|(name, _)| {
+                let audio_param = matches!(*name, "volume" | "pan");
+                if on_audio {
+                    return audio_param;
                 }
-                let finished = r.drag_stopped() || (r.changed() && !r.dragged()) || r.lost_focus();
-                if finished {
-                    if let Some((_, _, val)) = self.editing.take() {
-                        commit = Some(if keyed {
-                            SetKey { clip: id, param: name.into(), time: local, value: val, interp: Default::default() }
-                        } else {
-                            SetParam { clip: id, param: name.into(), value: val }
-                        });
+                !audio_param && !(matches!(*name, "rot_x" | "rot_y") && !is_model) && !(name.starts_with("mask_") && !has_mask)
+            })
+            .collect();
+        egui::Grid::new(("params", id)).num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
+            for (name, label) in visible {
+                let param = clip.params.get(name).unwrap();
+                let (_, lo, hi) = *PARAMS.iter().find(|p| p.0 == name).unwrap();
+                let range = match name {
+                    "x" | "y" => -4000.0..=4000.0,
+                    "scale" => 0.0..=8.0,
+                    "rotation" | "rot_x" | "rot_y" => -360.0..=360.0,
+                    "mask_x" | "mask_y" => -4000.0..=4000.0,
+                    "mask_w" | "mask_h" => 0.0..=8000.0,
+                    "mask_feather" => 0.0..=400.0,
+                    "volume" => 0.0..=4.0,
+                    _ => lo..=hi,
+                };
+                let mut v = match &self.editing {
+                    Some((c, n, v)) if *c == id && n == name => *v,
+                    _ => param.eval(local),
+                };
+                {
+                    ui.label(label);
+                    let keyed = !param.keys.is_empty();
+                    let r = ui.add(egui::Slider::new(&mut v, range).clamping(egui::SliderClamping::Never));
+                    if r.changed() {
+                        self.editing = Some((id, name.to_string(), v.clamp(lo, hi)));
                     }
+                    let finished = r.drag_stopped() || (r.changed() && !r.dragged()) || r.lost_focus();
+                    if finished {
+                        if let Some((_, _, val)) = self.editing.take() {
+                            commit = Some(if keyed {
+                                SetKey { clip: id, param: name.into(), time: local, value: val, interp: Default::default() }
+                            } else {
+                                SetParam { clip: id, param: name.into(), value: val }
+                            });
+                        }
+                    }
+                    if ui.small_button(if keyed { "◆" } else { "◇" }).on_hover_text(if keyed { "キーフレームあり。押すと再生位置にキーフレームを置く" } else { "再生位置にキーフレームを置く" }).clicked() {
+                        commit = Some(SetKey { clip: id, param: name.into(), time: local, value: v.clamp(lo, hi), interp: Default::default() });
+                    }
+                    ui.end_row();
                 }
-                if ui.small_button(if keyed { "◆" } else { "◇" }).on_hover_text("再生位置にキーフレームを置く").clicked() {
-                    commit = Some(SetKey { clip: id, param: name.into(), time: local, value: v.clamp(lo, hi), interp: Default::default() });
-                }
-            });
+            }
+        });
+        if on_audio {
+            ui.add_space(4.0);
+            if ui.button("ミキサーを開く(トラックの音量・エフェクト)").clicked() {
+                self.show_mixer = true;
+            }
         }
         if let Some(c) = commit {
             let l = c.name().to_string();
@@ -1297,6 +1333,7 @@ impl Studio {
         ui.separator();
         let on_video = self.editor.project.find_clip(id).is_some_and(|(ti, _)| self.editor.project.tracks[ti].kind == TrackKind::Video);
         if on_video {
+            section(ui, "追跡・貼り付け");
             let picking = self.pick_track == Some(id);
             let label = if picking { "クリックを待っています(取り消す)" } else { "点を追跡して追従させる" };
             if ui.add_enabled(self.track_job.is_none(), egui::Button::new(label)).on_hover_text("下のトラックの動画の上で追いたい点をプレビューでクリックすると、このクリップがその動きに合わせて動きます(再生位置からクリップの終わりまで)").clicked() {
@@ -1393,7 +1430,7 @@ impl Studio {
                 self.seek(Time::ZERO);
             }
             let fr = project.settings.frame_rate;
-            ui.monospace(format!("{}  [{}]  / {}", self.playhead, fr.time_to_frame(self.playhead), project.duration()));
+            ui.monospace(format!("{} / {}", self.playhead, project.duration())).on_hover_text(format!("フレーム {}", fr.time_to_frame(self.playhead)));
         });
         let tex = match self.renderer.render(&project, self.playhead) {
             Ok(t) => t,
@@ -1491,6 +1528,12 @@ impl Studio {
         PENDING_SRV.with(|p| *p.borrow_mut() = Some(srv));
         let _ = size;
     }
+}
+
+/// 調整欄の見出し。
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(title).small().strong().color(ui.visuals().weak_text_color()));
 }
 
 /// ファイルを素材として調べる(3D モデルは中身を読んで確かめる)。
@@ -1680,7 +1723,7 @@ impl ApplicationHandler<()> for Runner {
         }
     }
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        let w = el.create_window(WindowAttributes::default().with_title("Forge Studio").with_inner_size(PhysicalSize::new(1600, 960))).unwrap();
+        let w = el.create_window(WindowAttributes::default().with_title("Forge Studio").with_inner_size(PhysicalSize::new(1600, 960)).with_maximized(true)).unwrap();
         self.app = Some(App::new(&w, self.proxy.clone()));
         self.window = Some(w);
     }

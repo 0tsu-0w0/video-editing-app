@@ -6,7 +6,7 @@ use studio_core::{Command, Id, Project, Time, TrackKind};
 
 pub const HEADER_W: f32 = 120.0;
 const RULER_H: f32 = 22.0;
-const ROW_H: f32 = 44.0;
+const ROW_H: f32 = 36.0;
 const EDGE: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -210,6 +210,22 @@ impl Timeline {
                 if c.fade_out.0 > 0 {
                     let fx = self.x_of(rect, start + dur - c.fade_out).max(r.left());
                     painter.with_clip_rect(r).add(egui::Shape::convex_polygon(vec![Pos2::new(fx, r.top()), r.right_top(), r.right_bottom()], fade_col, Stroke::NONE));
+                }
+                // トランジション: 端に斜線の帯
+                let tr_col = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
+                for (tr, at_start) in [(c.transition_in, true), (c.transition_out, false)] {
+                    let Some(tr) = tr else { continue };
+                    let (x0, x1) = if at_start { (r.left(), self.x_of(rect, start + tr.duration).min(r.right())) } else { (self.x_of(rect, start + dur - tr.duration).max(r.left()), r.right()) };
+                    let band = Rect::from_min_max(Pos2::new(x0, r.top()), Pos2::new(x1, r.bottom()));
+                    let cp = painter.with_clip_rect(band.intersect(r));
+                    let mut x = band.left() - band.height();
+                    while x < band.right() {
+                        cp.line_segment([Pos2::new(x, band.bottom()), Pos2::new(x + band.height(), band.top())], Stroke::new(1.0, tr_col));
+                        x += 6.0;
+                    }
+                }
+                if c.mask.is_some() {
+                    painter.with_clip_rect(r).text(r.right_top() + Vec2::new(-4.0, 2.0), Align2::RIGHT_TOP, "◐", FontId::proportional(11.0), Color32::from_white_alpha(200));
                 }
                 let name = p.assets.get(&c.asset).map(|a| a.name.as_str()).unwrap_or("?");
                 painter.with_clip_rect(r).text(r.left_center() + Vec2::new(5.0, 0.0), Align2::LEFT_CENTER, name, FontId::proportional(12.0), Color32::WHITE);
