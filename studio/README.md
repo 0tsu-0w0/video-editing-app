@@ -35,7 +35,7 @@ claude mcp add forge-studio -- "C:\path\to\forge-studio-mcp.exe"
 Claude Desktop(`claude_desktop_config.json`):
 
 ```json
-{ "mcpServers": { "forge-studio": { "command": "C:\path\to\forge-studio-mcp.exe" } } }
+{ "mcpServers": { "forge-studio": { "command": "C:\\path\\to\\forge-studio-mcp.exe" } } }
 ```
 
 先に Forge Studio を起動しておく。Claude に「プロジェクトを見て、キャラ画像を 1 秒目から右から登場させて」のように頼む。
