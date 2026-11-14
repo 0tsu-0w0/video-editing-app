@@ -183,6 +183,12 @@ pub enum Command {
     /// トランジションを付ける・外す(edge: "in" は始まり、"out" は終わり。transition が無ければ外す)
     /// 再生速度を変える。同じ素材の範囲を使うよう、長さ・キーフレーム・フェードなどの時刻も合わせて伸び縮みする
     SetSpeed { clip: Id, speed: f64 },
+    /// 2 つのクリップをリンクする(一緒に動く)。other が無ければリンクを外す
+    SetLink {
+        clip: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        other: Option<Id>,
+    },
     /// 逆再生にする・戻す(素材の同じ範囲を、終わりから始まりへ再生する)
     SetReverse { clip: Id, reverse: bool },
     /// 速度を変えたときに音の高さを保つか(false ならテープの早回しのように高さも変わる)
@@ -280,6 +286,7 @@ impl Command {
             "set_chroma_key" => "クロマキー",
             "set_speed" => "速度",
             "set_reverse" => "逆再生",
+            "set_link" => "リンク",
             "set_keep_pitch" => "音の高さ",
             n => n,
         }
@@ -310,6 +317,7 @@ impl Command {
             Command::SetChromaKey { .. } => "set_chroma_key",
             Command::SetSpeed { .. } => "set_speed",
             Command::SetReverse { .. } => "set_reverse",
+            Command::SetLink { .. } => "set_link",
             Command::SetKeepPitch { .. } => "set_keep_pitch",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
@@ -547,7 +555,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 (None, None) => Time::from_secs_f64(5.0),
             };
             let id = take_id(p, id)?;
-            let clip = Clip { id, asset, start, duration, source_in, speed: 1.0, reverse: false, keep_pitch: true, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
+            let clip = Clip { id, asset, start, duration, source_in, speed: 1.0, reverse: false, keep_pitch: true, link: None, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
             check_clip_time(p, &clip)?;
             insert_clip(track_mut(p, track)?, clip)?;
             done(
@@ -650,7 +658,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             let left = at - c.start;
             t.clips[ci].duration = left;
             // 右側のキーフレームは、新しいクリップの開始基準に付け直す
-            let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: if c.reverse { c.source_in } else { c.source_at(left) }, fade_in: Time::ZERO, ..c.clone() };
+            let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: if c.reverse { c.source_in } else { c.source_at(left) }, fade_in: Time::ZERO, link: None, ..c.clone() };
             // 逆再生では、左側が素材の後ろの部分を使う
             if c.reverse {
                 t.clips[ci].source_in = c.source_in + scale_time(c.duration - left, c.speed);
@@ -828,6 +836,49 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 None,
                 format!("クリップ {clip} の速度を {speed} 倍に(長さ {})", c.duration),
             )
+        }
+        SetLink { clip, other } => {
+            if other == Some(clip) {
+                return err("invalid", "同じクリップどうしはリンクできません");
+            }
+            let c = p.clip(clip).ok_or(EditError { code: "not_found", message: format!("クリップ {clip} はありません") })?.clone();
+            if let Some(o) = other {
+                if p.clip(o).is_none() {
+                    return err("not_found", format!("クリップ {o} はありません"));
+                }
+            }
+            // 変わるクリップ: 自分、新しい相手、それぞれの元の相手
+            let mut ids = vec![clip];
+            ids.extend(c.link);
+            if let Some(o) = other {
+                ids.push(o);
+                ids.extend(p.clip(o).and_then(|x| x.link));
+            }
+            ids.sort();
+            ids.dedup();
+            let mut inverse = vec![];
+            for id in &ids {
+                let Some((ti, ci)) = p.find_clip(*id) else { continue };
+                unlocked(&p.tracks[ti])?;
+                inverse.push(RemoveClip { clip: *id });
+                inverse.push(RestoreClip { track: p.tracks[ti].id, clip: p.tracks[ti].clips[ci].clone() });
+            }
+            for id in &ids {
+                if let Some((ti, ci)) = p.find_clip(*id) {
+                    p.tracks[ti].clips[ci].link = None;
+                }
+            }
+            if let Some(o) = other {
+                let (ti, ci) = p.find_clip(clip).unwrap();
+                p.tracks[ti].clips[ci].link = Some(o);
+                let (ti, ci) = p.find_clip(o).unwrap();
+                p.tracks[ti].clips[ci].link = Some(clip);
+            }
+            let s = match other {
+                Some(o) => format!("クリップ {clip} と {o} をリンク"),
+                None => format!("クリップ {clip} のリンクを外す"),
+            };
+            done(inverse, cmd.clone(), None, s)
         }
         SetKeepPitch { clip, keep_pitch } => {
             let (t, ci) = clip_mut(p, clip)?;

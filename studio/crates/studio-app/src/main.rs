@@ -344,13 +344,19 @@ impl Studio {
                 }
             }
         };
-        if a.kind.has_video() {
-            let t = target(TrackKind::Video, &mut cmds);
-            cmds.push(AddClip { track: t, asset, start: at, duration: Some(dur), source_in: None, id: None });
+        let tv = a.kind.has_video().then(|| target(TrackKind::Video, &mut cmds));
+        let ta = a.kind.has_audio().then(|| target(TrackKind::Audio, &mut cmds));
+        // 映像と音声の両方があれば、リンクして一緒に動くようにする(クリップの ID も先に決める)
+        let mut next = p.next_id + new_tracks;
+        let mut ids = vec![];
+        for t in [tv, ta].into_iter().flatten() {
+            let id = Id(next);
+            next += 1;
+            ids.push(id);
+            cmds.push(AddClip { track: t, asset, start: at, duration: Some(dur), source_in: None, id: Some(id) });
         }
-        if a.kind.has_audio() {
-            let t = target(TrackKind::Audio, &mut cmds);
-            cmds.push(AddClip { track: t, asset, start: at, duration: Some(dur), source_in: None, id: None });
+        if let [v, s] = ids[..] {
+            cmds.push(Command::SetLink { clip: v, other: Some(s) });
         }
         if let Some(created) = self.run("素材を配置", cmds) {
             self.selected = created.last().copied();
@@ -1550,9 +1556,20 @@ impl Studio {
                 }
             }
         }
-        if ui.button("このクリップを削除").clicked() {
-            self.selected = None;
-            self.run("削除", vec![RemoveClip { clip: id }]);
+        let linked = self.editor.project.clip(id).and_then(|c| c.link).filter(|o| self.editor.project.clip(*o).is_some());
+        ui.horizontal(|ui| {
+            if ui.button("このクリップを削除").on_hover_text(if linked.is_some() { "リンクしている音声(映像)も一緒に消えます" } else { "" }).clicked() {
+                self.selected = None;
+                self.run("削除", vec![RemoveClip { clip: id }]);
+            }
+            if let Some(o) = linked {
+                if ui.button("リンクを外す").on_hover_text(format!("クリップ {o} と別々に動かせるようにします")).clicked() {
+                    self.run("リンク", vec![Command::SetLink { clip: id, other: None }]);
+                }
+            }
+        });
+        if let Some(o) = linked {
+            ui.weak(format!("クリップ {o} とリンク中(移動・伸縮・分割・削除・速度が一緒に効く)"));
         }
     }
 

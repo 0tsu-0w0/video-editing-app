@@ -177,6 +177,30 @@ impl Timeline {
             painter.text(head.left_center() + Vec2::new(6.0, 0.0), Align2::LEFT_CENTER, format!("{}{}", track.name, flags), FontId::proportional(13.0), vis.text_color());
             for c in &track.clips {
                 let (mut start, mut dur, mut row_i) = (c.start, c.duration, ti);
+                // リンクしている相手をドラッグ中なら、一緒に動いて見えるようにする
+                if let (Some(d), Some(pp)) = (self.drag.filter(|d| c.link == Some(d.clip) && d.clip != c.id), pointer) {
+                    let delta = self.t_of(rect, pp.x) - d.grab;
+                    let aligned = c.start == d.start && c.duration == d.duration;
+                    match d.kind {
+                        DragKind::Move => {
+                            let ns = self.snap(p, rect, (d.start + delta).max(Time::ZERO), playhead, d.clip);
+                            start = (c.start + (ns - d.start)).max(Time::ZERO);
+                        }
+                        DragKind::TrimStart if aligned => {
+                            let s = self.snap(p, rect, d.start + delta, playhead, d.clip).max(d.start_min()).min(d.start + d.duration - Time(1));
+                            start = s;
+                            dur = d.duration - (s - d.start);
+                        }
+                        DragKind::TrimEnd if aligned => {
+                            let mut e = self.snap(p, rect, d.start + d.duration + delta, playhead, d.clip).max(d.start + Time(1));
+                            if let Some(m) = d.end_max() {
+                                e = e.min(m);
+                            }
+                            dur = e - d.start;
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(d) = self.drag.filter(|d| d.clip == c.id) {
                     if let Some(pp) = pointer {
                         let now = self.t_of(rect, pp.x);

@@ -609,3 +609,62 @@ fn reverse_maps_time_backwards_and_split_keeps_picture() {
     let back: Project = serde_json::from_str(&serde_json::to_string(&ed.project).unwrap()).unwrap();
     assert_eq!(back, ed.project);
 }
+
+#[test]
+fn linked_clips_move_trim_split_and_delete_together() {
+    let (mut ed, v1, _v2, a1, movie, _img) = setup();
+    let o = ed
+        .transaction(
+            "置く",
+            vec![
+                AddClip { track: v1, asset: movie, start: s(1.0), duration: Some(s(4.0)), source_in: None, id: None },
+                AddClip { track: a1, asset: movie, start: s(1.0), duration: Some(s(4.0)), source_in: None, id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [v, a] = o.created[..] else { panic!() };
+    ed.execute(SetLink { clip: v, other: Some(a) }, Origin::User).unwrap();
+    assert_eq!((ed.project.clip(v).unwrap().link, ed.project.clip(a).unwrap().link), (Some(a), Some(v)));
+    let span = |ed: &Editor, id: Id| {
+        let c = ed.project.clip(id).unwrap();
+        (c.start, c.duration, c.source_in)
+    };
+    // 移動: 音声も同じだけ動く。1 回の取り消しで両方戻る
+    ed.execute(MoveClip { clip: v, start: s(2.0), track: None }, Origin::User).unwrap();
+    assert_eq!(span(&ed, a), (s(2.0), s(4.0), s(0.0)));
+    ed.undo();
+    assert_eq!(span(&ed, a).0, s(1.0));
+    ed.redo();
+    assert_eq!(span(&ed, a).0, s(2.0));
+    // 端の伸縮(左端を 0.5 秒詰める)
+    ed.execute(TrimClip { clip: a, start: Some(s(2.5)), duration: Some(s(3.5)), source_in: Some(s(0.5)) }, Origin::User).unwrap();
+    assert_eq!(span(&ed, v), (s(2.5), s(3.5), s(0.5)));
+    // 速度
+    ed.execute(SetSpeed { clip: v, speed: 2.0 }, Origin::User).unwrap();
+    assert_eq!(ed.project.clip(a).unwrap().speed, 2.0);
+    ed.undo();
+    // 分割: 両方が分かれ、右側どうしもリンクされる
+    let r = ed.execute(SplitClip { clip: v, at: s(4.0), new_id: None }, Origin::User).unwrap().created[0];
+    let ra = ed.project.clip(r).unwrap().link.unwrap();
+    assert_eq!(ed.project.clip(ra).unwrap().link, Some(r));
+    assert_eq!(span(&ed, ra), span(&ed, r));
+    assert_eq!(ed.project.clip(v).unwrap().link, Some(a));
+    // 削除: 相手も消える。取り消すと両方戻る
+    ed.execute(RemoveClip { clip: r }, Origin::User).unwrap();
+    assert!(ed.project.clip(ra).is_none());
+    ed.undo();
+    assert!(ed.project.clip(ra).is_some() && ed.project.clip(r).is_some());
+    // 相手が重なって動けないときは、両方とも動かない
+    ed.execute(AddClip { track: a1, asset: movie, start: s(8.0), duration: Some(s(1.0)), source_in: None, id: None }, Origin::User).unwrap();
+    let e = ed.execute(MoveClip { clip: r, start: s(7.5), track: None }, Origin::User).unwrap_err().to_string();
+    assert!(e.contains("リンク"), "{e}");
+    assert_eq!(span(&ed, r).0, s(4.0));
+    // リンクを外すと別々に動く
+    ed.execute(SetLink { clip: v, other: None }, Origin::User).unwrap();
+    assert_eq!(ed.project.clip(a).unwrap().link, None);
+    ed.execute(MoveClip { clip: v, start: s(0.0), track: None }, Origin::User).unwrap();
+    assert_eq!(span(&ed, a).0, s(2.5));
+    let back: Project = serde_json::from_str(&serde_json::to_string(&ed.project).unwrap()).unwrap();
+    assert_eq!(back, ed.project);
+}

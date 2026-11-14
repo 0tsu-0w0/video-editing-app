@@ -454,6 +454,9 @@ pub struct Clip {
     /// 速度を変えても音の高さを保つ(false ならテープの早回しのように高さも変わる)
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub keep_pitch: bool,
+    /// 一緒に動くクリップ(動画の映像と音声など)。移動・端の伸縮・分割・削除・速度・逆再生がもう一方にも効く
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Id>,
     #[serde(default)]
     pub params: ClipParams,
     /// フェードイン・フェードアウトの長さ(映像は不透明度、音声は音量に効く)

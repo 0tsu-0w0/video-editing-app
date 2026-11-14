@@ -51,6 +51,8 @@ pub fn command_schema() -> Value {
                 "clip": "クリップ ID", "speed": "数値"}},
             {"command": "set_reverse", "description": "逆再生にする(reverse: true)・戻す(false)。素材の同じ範囲を終わりから始まりへ再生する(音声も逆になる)。set_speed と組み合わせられる", "args": {
                 "clip": "クリップ ID", "reverse": "true / false"}},
+            {"command": "set_link", "description": "2 つのクリップをリンクする(動画の映像と音声など)。リンクしたクリップは、片方への move_clip・remove_clip・split_clip と、時間がそろっているときの trim_clip・set_speed・set_reverse が、もう一方にも自動で効く(相手の分のコマンドは送らない)。other を省略するとリンクを外す", "args": {
+                "clip": "クリップ ID", "other": "(任意)相手のクリップ ID"}},
             {"command": "set_keep_pitch", "description": "速度を変えたクリップの音の高さを保つか(既定は true。false ならテープの早回しのように高さも変わる)", "args": {
                 "clip": "クリップ ID", "keep_pitch": "true / false"}},
             {"command": "set_chroma_key", "description": "クロマキー: 指定した色(グリーンバックの緑など)に近い所を透明にする。key を省略すると外す。色の調整は params の brightness / contrast / saturation(-1〜1、0 で元のまま)・hue(色相、度)、ぼかしは blur(半径ピクセル)で、どれもキーフレームを置ける", "args": {
@@ -169,6 +171,9 @@ pub fn describe(p: &Project) -> Value {
                     }
                     if c.reverse {
                         extra.insert("reverse".into(), json!(true));
+                    }
+                    if let Some(l) = c.link {
+                        extra.insert("link".into(), json!(l.0));
                     }
                     if c.speed != 1.0 && !c.keep_pitch {
                         extra.insert("keep_pitch".into(), json!(false));
@@ -330,7 +335,7 @@ mod tests {
             serde_json::from_value::<Command>(ex.clone()).unwrap();
         }
         let names: Vec<&str> = s["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask", "set_chroma_key", "set_speed", "set_reverse", "set_keep_pitch"] {
+        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask", "set_chroma_key", "set_speed", "set_reverse", "set_keep_pitch", "set_link"] {
             assert!(names.contains(&n), "{n} の説明がない");
         }
         assert!(!names.iter().any(|n| n.starts_with("restore")), "内部用コマンドを公開しない");
