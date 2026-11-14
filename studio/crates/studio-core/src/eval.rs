@@ -185,6 +185,8 @@ pub struct AudioSpan {
     pub speed: f64,
     /// 逆再生(source_start から素材を後ろへ向かって読む)
     pub reverse: bool,
+    /// 音の高さを保つ
+    pub keep_pitch: bool,
 }
 
 pub fn audio_spans(p: &Project, from: Time, to: Time) -> Vec<AudioSpan> {
@@ -201,7 +203,7 @@ pub fn track_audio_spans(p: &Project, from: Time, to: Time, with_muted: bool) ->
             }
             let s = c.start.max(from);
             let e = c.end().min(to);
-            out.push(AudioSpan { track: track.id, clip: c.id, asset: c.asset, start: s, end: e, source_start: c.source_at(s - c.start), clip_start: c.start, speed: c.speed, reverse: c.reverse });
+            out.push(AudioSpan { track: track.id, clip: c.id, asset: c.asset, start: s, end: e, source_start: c.source_at(s - c.start), clip_start: c.start, speed: c.speed, reverse: c.reverse, keep_pitch: c.keep_pitch });
         }
     }
     out

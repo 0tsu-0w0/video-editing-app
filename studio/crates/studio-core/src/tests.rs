@@ -573,7 +573,13 @@ fn speed_rescales_clip_keys_and_source_and_undoes() {
     ed.undo();
     ed.undo();
     assert_eq!(ed.project.tracks, before.tracks);
-    let _ = ed.project.clip(c).unwrap().source_len();
+    // 音の高さを保つのが既定(古いプロジェクトに項目が無くても)。切り替えて取り消せる
+    assert!(ed.project.clip(c).unwrap().keep_pitch);
+    ed.execute(SetKeepPitch { clip: c, keep_pitch: false }, Origin::User).unwrap();
+    let j = serde_json::to_string(&ed.project).unwrap();
+    assert!(j.contains("\"keep_pitch\":false"));
+    ed.undo();
+    assert!(!serde_json::to_string(&ed.project).unwrap().contains("keep_pitch"));
 }
 
 #[test]

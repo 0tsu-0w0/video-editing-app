@@ -1339,7 +1339,7 @@ impl Studio {
         let timed = self.editor.project.assets.get(&clip.asset).is_some_and(|a| a.kind.duration().is_some());
         if timed {
             ui.horizontal(|ui| {
-                ui.label("速度");
+                ui.label("速度").on_hover_text("同じ素材の範囲を、速度に合わせた長さで再生します(2 倍なら長さが半分)");
                 let mut sp = match self.speed_edit {
                     Some((c, v)) if c == id => v,
                     _ => clip.speed,
@@ -1364,9 +1364,17 @@ impl Studio {
                 if ui.checkbox(&mut rev, "逆再生").on_hover_text("素材の同じ範囲を、終わりから始まりへ再生します").changed() {
                     self.run("逆再生", vec![Command::SetReverse { clip: id, reverse: rev }]);
                 }
-            })
-            .response
-            .on_hover_text("同じ素材の範囲を、速度に合わせた長さで再生します(2 倍なら長さが半分)。音声は高さも変わります");
+            });
+            if clip.speed != 1.0 {
+                let mut kp = clip.keep_pitch;
+                if ui
+                    .checkbox(&mut kp, "音の高さを保つ")
+                    .on_hover_text("オフにすると、テープの早回しのように速さに合わせて音の高さも変わります")
+                    .changed()
+                {
+                    self.run("音の高さ", vec![Command::SetKeepPitch { clip: id, keep_pitch: kp }]);
+                }
+            }
         }
         let on_video_track = self.editor.project.find_clip(id).is_some_and(|(ti, _)| self.editor.project.tracks[ti].kind == TrackKind::Video);
         if on_video_track {

@@ -185,6 +185,8 @@ pub enum Command {
     SetSpeed { clip: Id, speed: f64 },
     /// 逆再生にする・戻す(素材の同じ範囲を、終わりから始まりへ再生する)
     SetReverse { clip: Id, reverse: bool },
+    /// 速度を変えたときに音の高さを保つか(false ならテープの早回しのように高さも変わる)
+    SetKeepPitch { clip: Id, keep_pitch: bool },
     /// クロマキーを付ける・外す(key が無ければ外す)
     SetChromaKey {
         clip: Id,
@@ -278,6 +280,7 @@ impl Command {
             "set_chroma_key" => "クロマキー",
             "set_speed" => "速度",
             "set_reverse" => "逆再生",
+            "set_keep_pitch" => "音の高さ",
             n => n,
         }
     }
@@ -307,6 +310,7 @@ impl Command {
             Command::SetChromaKey { .. } => "set_chroma_key",
             Command::SetSpeed { .. } => "set_speed",
             Command::SetReverse { .. } => "set_reverse",
+            Command::SetKeepPitch { .. } => "set_keep_pitch",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
             Command::RemoveKey { .. } => "remove_key",
@@ -543,7 +547,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 (None, None) => Time::from_secs_f64(5.0),
             };
             let id = take_id(p, id)?;
-            let clip = Clip { id, asset, start, duration, source_in, speed: 1.0, reverse: false, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
+            let clip = Clip { id, asset, start, duration, source_in, speed: 1.0, reverse: false, keep_pitch: true, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
             check_clip_time(p, &clip)?;
             insert_clip(track_mut(p, track)?, clip)?;
             done(
@@ -824,6 +828,15 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 None,
                 format!("クリップ {clip} の速度を {speed} 倍に(長さ {})", c.duration),
             )
+        }
+        SetKeepPitch { clip, keep_pitch } => {
+            let (t, ci) = clip_mut(p, clip)?;
+            unlocked(t)?;
+            let tid = t.id;
+            let old = t.clips[ci].clone();
+            t.clips[ci].keep_pitch = keep_pitch;
+            let s = format!("クリップ {clip} の速度を変えたときの音の高さを{}", if keep_pitch { "保つ" } else { "速度に合わせて変える" });
+            done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)
         }
         SetReverse { clip, reverse } => {
             let (t, ci) = clip_mut(p, clip)?;

@@ -722,12 +722,18 @@ fn speed_changes_video_frame_and_audio_pitch() {
     assert_eq!(read_index(&img, W), FPS);
     let img = r.render_bgra(&ed.project, s(1.25)).unwrap();
     assert_eq!(read_index(&img, W), FPS * 5 / 2);
-    // 音声: 440Hz が 880Hz になる(0.5〜1.5 秒の、上向きのゼロ交差の数)
+    // 音声(高さを保つ、既定): 440Hz のまま(0.5〜1.5 秒の、上向きのゼロ交差の数)
+    let ups = |buf: &[f32]| {
+        let l: Vec<f32> = buf.chunks(2).map(|c| c[0]).collect();
+        l[24_000..72_000].windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count()
+    };
+    let u = ups(&mix_all(&ed.project));
+    assert!((435..=445).contains(&u), "高さを保つ: 上向きのゼロ交差 {u}");
+    // 高さを保たない: 440Hz が 880Hz になる
+    ed.execute(SetKeepPitch { clip: ca, keep_pitch: false }, Origin::User).unwrap();
     let buf = mix_all(&ed.project);
-    let l: Vec<f32> = buf.chunks(2).map(|c| c[0]).collect();
-    let seg = &l[24_000..72_000];
-    let ups = seg.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
-    assert!((875..=885).contains(&ups), "上向きのゼロ交差 {ups}");
+    let u = ups(&buf);
+    assert!((875..=885).contains(&u), "テープ式: 上向きのゼロ交差 {u}");
     // 2 倍速で 2 秒の長さになったので、2 秒以降は無音
     let (pl, _) = peak_in(&buf, 2.1, 2.9);
     assert!(pl < 1e-3, "{pl}");

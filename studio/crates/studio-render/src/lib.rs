@@ -5,6 +5,7 @@
 //! - `export`: プロジェクト全体を MP4 に書き出す
 
 pub mod audio_fx;
+pub mod stretch;
 pub mod gpu;
 pub mod model;
 pub mod text;
@@ -246,6 +247,8 @@ pub struct Mixer {
     rate: u32,
     readers: HashMap<Id, Option<AudioReader>>,
     fx: HashMap<(Id, usize), audio_fx::FxState>,
+    /// 高さを保って速さを変えるときの、クリップごとの粒の位置
+    grains: HashMap<Id, std::collections::BTreeMap<i64, i64>>,
     next: Option<i64>,
     pub levels: Levels,
 }
@@ -256,13 +259,14 @@ fn peak(buf: &[f32]) -> (f32, f32) {
 
 impl Mixer {
     pub fn new(rate: u32) -> Self {
-        Self { rate, readers: HashMap::new(), fx: HashMap::new(), next: None, levels: Levels::default() }
+        Self { rate, readers: HashMap::new(), fx: HashMap::new(), grains: HashMap::new(), next: None, levels: Levels::default() }
     }
 
     /// 標本番号 start から frames 標本分(ステレオ f32)。
     pub fn mix(&mut self, project: &Project, start: i64, frames: usize) -> Vec<f32> {
         if self.next != Some(start) {
             self.fx.clear();
+            self.grains.clear();
         }
         self.next = Some(start + frames as i64);
         let (from, to) = (sample_to_time(start, self.rate), sample_to_time(start + frames as i64, self.rate));
@@ -283,6 +287,26 @@ impl Mixer {
             let src_start = time_to_sample(span.source_start, self.rate);
             let buf = if span.speed == 1.0 && !span.reverse {
                 let Ok(b) = reader.read(src_start, n) else { continue };
+                b
+            } else if span.keep_pitch && span.speed != 1.0 {
+                // 高さを保って速さを変える。位置はクリップ内の標本で数える
+                let rate = self.rate as f64;
+                let local0 = s0 - time_to_sample(span.clip_start, self.rate);
+                let (sp, rev) = (span.speed, span.reverse);
+                let lo = clip.source_in.secs_f64() * rate;
+                let hi = (clip.source_in + clip.source_len()).secs_f64() * rate - 1.0;
+                let pos = move |l: i64| if rev { hi - l as f64 * sp } else { lo + l as f64 * sp };
+                let starts = self.grains.entry(span.clip).or_default();
+                let mut failed = false;
+                let b = stretch::stretch(local0, n, pos, if rev { -1 } else { 1 }, starts, |s, f| {
+                    reader.read(s, f).unwrap_or_else(|_| {
+                        failed = true;
+                        vec![0.0; f * 2]
+                    })
+                });
+                if failed {
+                    continue;
+                }
                 b
             } else {
                 // 速度が違うときは、必要な長さを読んで直線補間で詰める・伸ばす(音の高さも変わる)。

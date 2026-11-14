@@ -451,6 +451,9 @@ pub struct Clip {
     /// 逆再生(素材の同じ範囲を、終わりから始まりへ)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reverse: bool,
+    /// 速度を変えても音の高さを保つ(false ならテープの早回しのように高さも変わる)
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub keep_pitch: bool,
     #[serde(default)]
     pub params: ClipParams,
     /// フェードイン・フェードアウトの長さ(映像は不透明度、音声は音量に効く)
@@ -634,6 +637,12 @@ pub fn check_pin(keys: &[PinKey]) -> Result<(), String> {
     Ok(())
 }
 
+fn yes() -> bool {
+    true
+}
+fn is_yes(v: &bool) -> bool {
+    *v
+}
 fn one() -> f64 {
     1.0
 }
