@@ -84,6 +84,15 @@ struct TrackJob {
     label: &'static str,
 }
 
+/// プロキシ作成の進み具合(別スレッドと共有)。
+struct ProxyJob {
+    asset: Id,
+    /// 千分率
+    permille: Arc<AtomicI64>,
+    cancel: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+}
+
 /// プレビューで四隅をクリックして指定する用途。
 #[derive(Clone, Copy, PartialEq)]
 enum PinPick {
@@ -121,6 +130,13 @@ struct Studio {
     pick_corners: Option<(Id, PinPick, Vec<(f64, f64)>)>,
     /// ミキサーの窓を出すか
     show_mixer: bool,
+    /// プレビューでプロキシを使うか
+    use_proxies: bool,
+    /// プロキシを作る順番待ちと、作成中のもの
+    proxy_queue: VecDeque<Id>,
+    proxy_job: Option<ProxyJob>,
+    /// 自動でプロキシを作るか確かめ済みの素材
+    proxy_checked: std::collections::HashSet<Id>,
     /// メーターの表示値(ゆっくり下げる)
     meters: std::collections::HashMap<u64, (f32, f32)>,
     last_track_result: String,
@@ -166,7 +182,11 @@ impl Studio {
             selected: None,
             timeline: Timeline::default(),
             audio,
-            renderer: Renderer::new(gpu),
+            renderer: {
+                let mut r = Renderer::new(gpu);
+                r.set_use_proxies(true);
+                r
+            },
             preview: None,
             status,
             export: None,
@@ -180,6 +200,10 @@ impl Studio {
             pick_person: None,
             person_part: "head",
             pick_corners: None,
+            use_proxies: true,
+            proxy_queue: VecDeque::new(),
+            proxy_job: None,
+            proxy_checked: Default::default(),
             show_mixer: std::env::var("STUDIO_SHOW_MIXER").is_ok_and(|v| v == "1"),
             meters: Default::default(),
             last_track_result: String::new(),
@@ -208,10 +232,75 @@ impl Studio {
             match probe(&f) {
                 Ok(kind) => {
                     let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    self.run("素材の読み込み", vec![ImportAsset { name, path: f.to_string_lossy().into(), kind, id: None }]);
+                    let auto = studio_media::proxy::worth_proxy(&kind) && studio_media::proxy::existing_proxy(&f).is_none();
+                    if let Some(ids) = self.run("素材の読み込み", vec![ImportAsset { name, path: f.to_string_lossy().into(), kind, id: None }]) {
+                        if auto {
+                            self.queue_proxy(ids[0]);
+                        }
+                    }
                 }
                 Err(e) => self.status = format!("読み込めません: {e}"),
             }
+        }
+    }
+
+    /// プロキシを作る順番待ちに入れる。
+    fn queue_proxy(&mut self, asset: Id) {
+        if self.proxy_job.as_ref().is_some_and(|j| j.asset == asset) || self.proxy_queue.contains(&asset) {
+            return;
+        }
+        self.proxy_queue.push_back(asset);
+    }
+
+    /// 終わったプロキシを反映し、次を始める。
+    fn pump_proxies(&mut self) {
+        // 新しく入った大きな動画(画面・MCP・開いたプロジェクトのどれからでも)は、自動でプロキシを作る
+        let new: Vec<(Id, String, bool)> = self
+            .editor
+            .project
+            .assets
+            .values()
+            .filter(|a| !self.proxy_checked.contains(&a.id))
+            .map(|a| (a.id, a.path.clone(), studio_media::proxy::worth_proxy(&a.kind)))
+            .collect();
+        for (id, path, worth) in new {
+            self.proxy_checked.insert(id);
+            if worth && Path::new(&path).exists() && studio_media::proxy::existing_proxy(Path::new(&path)).is_none() {
+                self.queue_proxy(id);
+            }
+        }
+        if let Some(job) = &self.proxy_job {
+            let Some(r) = job.result.lock().unwrap().take() else { return };
+            let asset = job.asset;
+            self.proxy_job = None;
+            let name = self.editor.project.assets.get(&asset).map(|a| a.name.clone()).unwrap_or_default();
+            match r {
+                Ok(_) => {
+                    // 開いている動画を閉じ、次の描画からプロキシを使う
+                    self.renderer.forget(asset);
+                    self.status = format!("「{name}」のプロキシができました(プレビューが軽くなります。書き出しは元の動画を使います)");
+                }
+                Err(e) => self.status = format!("「{name}」のプロキシを作れませんでした: {e}"),
+            }
+        }
+        while let Some(asset) = self.proxy_queue.pop_front() {
+            let Some(a) = self.editor.project.assets.get(&asset) else { continue };
+            let path = PathBuf::from(&a.path);
+            if studio_media::proxy::existing_proxy(&path).is_some() {
+                continue;
+            }
+            let job = ProxyJob { asset, permille: Arc::new(AtomicI64::new(0)), cancel: Arc::new(AtomicBool::new(false)), result: Arc::new(Mutex::new(None)) };
+            let (pm, cancel, result) = (job.permille.clone(), job.cancel.clone(), job.result.clone());
+            std::thread::spawn(move || {
+                let r = studio_media::proxy::make_proxy(&path, |f| {
+                    pm.store((f * 1000.0) as i64, Ordering::Relaxed);
+                    !cancel.load(Ordering::Relaxed)
+                })
+                .map_err(|e| e.to_string());
+                *result.lock().unwrap() = Some(r);
+            });
+            self.proxy_job = Some(job);
+            break;
         }
     }
 
@@ -300,6 +389,18 @@ impl Studio {
                 self.selected = None;
                 let gpu = std::mem::replace(&mut self.renderer, Renderer::new(Gpu::new(None).expect("GPU")));
                 self.renderer = Renderer::new(gpu.gpu);
+                self.renderer.set_use_proxies(self.use_proxies);
+                let want: Vec<Id> = self
+                    .editor
+                    .project
+                    .assets
+                    .values()
+                    .filter(|a| studio_media::proxy::worth_proxy(&a.kind) && studio_media::proxy::existing_proxy(Path::new(&a.path)).is_none() && Path::new(&a.path).exists())
+                    .map(|a| a.id)
+                    .collect();
+                for a in want {
+                    self.queue_proxy(a);
+                }
                 let missing: Vec<String> = self.editor.project.assets.values().filter(|a| !Path::new(&a.path).exists()).map(|a| a.name.clone()).collect();
                 self.status = if missing.is_empty() { format!("開きました: {}", path.display()) } else { format!("見つからない素材があります: {}", missing.join(", ")) };
             }
@@ -987,6 +1088,9 @@ impl Studio {
                     self.add_text();
                 }
                 ui.toggle_value(&mut self.show_mixer, "ミキサー");
+                if ui.checkbox(&mut self.use_proxies, "軽量表示").on_hover_text("プロキシ(高さ 540 の軽い代わりの動画)がある動画は、プレビューでそれを使う。書き出しは常に元の動画").changed() {
+                    self.renderer.set_use_proxies(self.use_proxies);
+                }
                 ui.separator();
                 if ui.add_enabled(self.export.is_none(), egui::Button::new("書き出し")).clicked() {
                     self.start_export();
@@ -1011,6 +1115,17 @@ impl Studio {
                     }
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 }
+                if let Some(job) = &self.proxy_job {
+                    let name = self.editor.project.assets.get(&job.asset).map(|a| a.name.clone()).unwrap_or_default();
+                    let f = job.permille.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let more = if self.proxy_queue.is_empty() { String::new() } else { format!("(ほか {} 件)", self.proxy_queue.len()) };
+                    ui.add(egui::ProgressBar::new(f).desired_width(200.0).text(format!("プロキシ作成 {name} {:.0}%{more}", f * 100.0)));
+                    if ui.button("中止").on_hover_text("作りかけのプロキシを捨てる").clicked() {
+                        job.cancel.store(true, Ordering::Relaxed);
+                        self.proxy_queue.clear();
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                }
                 if let Some(job) = &self.track_job {
                     let (d, t) = (job.done.load(Ordering::Relaxed), job.total.load(Ordering::Relaxed).max(1));
                     ui.add(egui::ProgressBar::new(d as f32 / t as f32).desired_width(200.0).text(format!("トラッキング中 {d}/{t}")));
@@ -1025,6 +1140,7 @@ impl Studio {
             });
         });
         self.finish_tracking();
+        self.pump_proxies();
         let finished = self.export.as_ref().and_then(|job| {
             let r = job.result.lock().unwrap().take();
             r.map(|r| (r, job.path.clone()))
@@ -1058,6 +1174,8 @@ impl Studio {
         egui::Panel::left("assets").resizable(true).default_size(220.0).show(ui, |ui| {
             let mut place = None;
             let mut remove = None;
+            let mut make_proxy = None;
+            let proxy_busy: Vec<Id> = self.proxy_job.iter().map(|j| j.asset).chain(self.proxy_queue.iter().copied()).collect();
             egui::ScrollArea::vertical().id_salt("left").auto_shrink([false, false]).show(ui, |ui| {
                 egui::CollapsingHeader::new(egui::RichText::new(format!("素材({})", self.editor.project.assets.len())).strong()).default_open(true).show(ui, |ui| {
                     if self.editor.project.assets.is_empty() {
@@ -1084,6 +1202,15 @@ impl Studio {
                                     remove = Some(a.id);
                                 }
                             });
+                            if matches!(a.kind, AssetKind::Video { .. }) {
+                                if proxy_busy.contains(&a.id) {
+                                    ui.weak("プロキシ: 作成中・順番待ち");
+                                } else if studio_media::proxy::existing_proxy(Path::new(&a.path)).is_some() {
+                                    ui.weak("プロキシ: あり(プレビューで使用)");
+                                } else if ui.small_button("プロキシを作る").on_hover_text("プレビュー用の軽い代わりの動画を作る(長い動画・高解像度の動画のシークが速くなる)").clicked() {
+                                    make_proxy = Some(a.id);
+                                }
+                            }
                         });
                     }
                 });
@@ -1091,6 +1218,9 @@ impl Studio {
             });
             if let Some(a) = place {
                 self.place_asset(a);
+            }
+            if let Some(a) = make_proxy {
+                self.queue_proxy(a);
             }
             if let Some(a) = remove {
                 self.run("素材の削除", vec![RemoveAsset { asset: a }]);

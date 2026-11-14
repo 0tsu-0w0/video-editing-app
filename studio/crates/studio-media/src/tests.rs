@@ -163,3 +163,76 @@ fn image_probe_and_load() {
     assert_eq!(&f.bgra[..4], &[0, 0, 255, 128]); // BGRA に並べ替え、アルファは保持
     assert!(probe(&dir.join("no_such_file.mp4")).is_err());
 }
+
+#[test]
+fn proxy_is_small_frame_exact_and_seeks_fast() {
+    let dir = std::env::temp_dir().join(format!("studio-proxy-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // SAFETY: このテストの中だけで使う(ほかのテストはこの変数を読まない)
+    unsafe { std::env::set_var("STUDIO_PROXY_DIR", dir.join("proxies")) };
+    // 1280x720・10 秒・フレーム番号入り(キーフレームの間隔は既定のまま = 長い)
+    let (w, h, n) = (1280u32, 720u32, 300u32);
+    let src = dir.join("source.mp4");
+    let mut ex = Exporter::create(&src, &ExportSettings { width: w, height: h, frame_rate: Rate::new(30, 1), video_bitrate: 8_000_000, sample_rate: None, audio_bitrate: 0 }).unwrap();
+    for i in 0..n {
+        let mut v = vec![0u8; (w * h * 4) as usize];
+        for (k, px) in v.chunks_exact_mut(4).enumerate() {
+            let (x, y) = (k as u32 % w, k as u32 / w);
+            let base = (40 + (x + y + i * 7) % 120) as u8;
+            px.copy_from_slice(&[base, base, base, 255]);
+            // フレーム番号: 64x64 のブロック 9 個
+            if y < 64 && x < 64 * 9 && (i >> (x / 64)) & 1 == 1 {
+                px.copy_from_slice(&[255, 255, 255, 255]);
+            } else if y < 64 && x < 64 * 9 {
+                px.copy_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+        ex.write_frame(&v).unwrap();
+    }
+    ex.finish().unwrap();
+
+    assert!(proxy::existing_proxy(&src).is_none());
+    let mut calls = 0;
+    let p = proxy::make_proxy(&src, |_| {
+        calls += 1;
+        true
+    })
+    .unwrap();
+    assert!(calls > 3);
+    assert_eq!(proxy::existing_proxy(&src).as_deref(), Some(p.as_path()));
+    let AssetKind::Video { width, height, duration, .. } = probe(&p).unwrap() else { panic!() };
+    assert_eq!((width, height), (960, 540));
+    let AssetKind::Video { duration: d0, .. } = probe(&src).unwrap() else { panic!() };
+    assert!((duration.secs_f64() - d0.secs_f64()).abs() < 0.05, "{duration} / {d0}");
+    let read_index = |f: &Frame| {
+        let s = f.width as f64 / 1280.0;
+        (0..9).fold(0u32, |a, b| {
+            let (x, y) = (((b * 64 + 32) as f64 * s) as u32, (32.0 * s) as u32);
+            let i = ((y * f.width + x) * 4) as usize;
+            a | (((f.bgra[i] > 128) as u32) << b)
+        })
+    };
+    // 飛び飛びの位置へシーク: どちらも同じフレームが出る。時間を比べる
+    let order = [250u32, 30, 199, 7, 280, 120, 61, 299, 5, 175, 90, 240];
+    let time = |path: &Path| {
+        let mut r = VideoReader::open(path).unwrap();
+        let t0 = std::time::Instant::now();
+        for &k in &order {
+            let f = r.frame_at(Rate::new(30, 1).frame_to_time(k as i64) + Time(1000)).unwrap();
+            assert_eq!(read_index(f), k, "{} のフレーム {k}", path.display());
+        }
+        t0.elapsed().as_secs_f64() * 1000.0 / order.len() as f64
+    };
+    let (orig, prox) = (time(&src), time(&p));
+    eprintln!("シーク 1 回あたり: 元 {orig:.1}ms / プロキシ {prox:.1}ms");
+    assert!(prox < orig, "プロキシの方が遅い: {prox} / {orig}");
+    // 元のファイルが変わったら別のプロキシ扱い
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let f = std::fs::File::options().write(true).open(&src).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+    drop(f);
+    assert!(proxy::existing_proxy(&src).is_none());
+    assert_eq!(proxy::proxy_size(3840, 2160), (960, 540));
+    assert_eq!(proxy::proxy_size(1080, 1920), (304, 540));
+    std::fs::remove_dir_all(&dir).ok();
+}

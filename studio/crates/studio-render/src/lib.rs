@@ -35,11 +35,13 @@ pub struct Renderer {
     /// 読み込めなかった素材(画面に出すための一覧)
     pub errors: Vec<String>,
     model_pipe: Option<model::ModelPipeline>,
+    /// プレビュー用: 動画にプロキシがあればそれを使う(書き出しでは使わない)
+    use_proxies: bool,
 }
 
 impl Renderer {
     pub fn new(gpu: Gpu) -> Self {
-        Self { gpu, sources: HashMap::new(), target: None, errors: vec![], model_pipe: None }
+        Self { gpu, sources: HashMap::new(), target: None, errors: vec![], model_pipe: None, use_proxies: false }
     }
 
     fn source(&mut self, project: &Project, asset: Id, slot: u8) -> &mut Source {
@@ -56,7 +58,7 @@ impl Renderer {
                 Some(a) => {
                     let path = Path::new(&a.path);
                     match &a.kind {
-                        AssetKind::Video { .. } => match VideoReader::open(path) {
+                        AssetKind::Video { .. } => match VideoReader::open(&if self.use_proxies { studio_media::proxy::existing_proxy(path).unwrap_or(path.to_path_buf()) } else { path.to_path_buf() }) {
                             Ok(reader) => Source::Video { reader, tex: None, shown: None },
                             Err(e) => Source::Broken(format!("「{}」: {e}", a.name)),
                         },
@@ -87,6 +89,18 @@ impl Renderer {
             self.sources.insert(key, s);
         }
         self.sources.get_mut(&key).unwrap()
+    }
+
+    /// プロキシを使うかを切り替える(開いている動画は開き直す)。
+    pub fn set_use_proxies(&mut self, on: bool) {
+        if self.use_proxies != on {
+            self.use_proxies = on;
+            self.sources.retain(|_, s| !matches!(s, Source::Video { .. }));
+        }
+    }
+
+    pub fn use_proxies(&self) -> bool {
+        self.use_proxies
     }
 
     /// 素材の差し替えなどで、キャッシュを捨てる。
@@ -149,7 +163,12 @@ impl Renderer {
                 }
                 Source::Broken(_) => continue,
             };
-            gpu.set_mask(&mask_cb(&layer, tex.width, tex.height));
+            // プロキシは小さいので、置き方とマスクは元の動画の大きさで計算する
+            let (tw, th) = match project.assets.get(&layer.asset).map(|a| &a.kind) {
+                Some(AssetKind::Video { width, height, .. }) => (*width, *height),
+                _ => (tex.width, tex.height),
+            };
+            gpu.set_mask(&mask_cb(&layer, tw, th));
             if let Some(c) = &layer.corners {
                 gpu.draw_pinned(&rtv, (w, h), tex, c, layer.opacity);
                 continue;
@@ -159,8 +178,8 @@ impl Renderer {
                 (w, h),
                 tex,
                 &Placement {
-                    width: tex.width as f64,
-                    height: tex.height as f64,
+                    width: tw as f64,
+                    height: th as f64,
                     x: layer.x,
                     y: layer.y,
                     scale: layer.scale,

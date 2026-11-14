@@ -186,6 +186,12 @@ impl VideoReader {
         (self.width, self.height)
     }
 
+    /// 先頭から順に読むときの、次のフレーム(終わりなら None)。
+    pub fn next_frame(&mut self) -> R<Option<Frame>> {
+        init();
+        self.read_next()
+    }
+
     fn read_next(&mut self) -> R<Option<Frame>> {
         unsafe {
             loop {
@@ -390,7 +396,13 @@ pub struct ExportSettings {
 }
 
 impl Exporter {
+    /// 書き出す(2 秒ごとにキーフレーム。書き出した動画を後で編集してもシークが速いように)。
     pub fn create(path: &Path, s: &ExportSettings) -> R<Self> {
+        Self::create_with_keyframes(path, s, Some((s.frame_rate.fps() * 2.0).round().max(1.0) as u32))
+    }
+
+    /// `keyframe_every` フレームごとにキーフレームを入れて書き出す(シークを速くしたいプロキシ用)。
+    pub fn create_with_keyframes(path: &Path, s: &ExportSettings, keyframe_every: Option<u32>) -> R<Self> {
         init();
         if s.width % 2 != 0 || s.height % 2 != 0 {
             return Err(MediaError::Write("幅と高さは偶数にしてください".into()));
@@ -415,8 +427,21 @@ impl Exporter {
             };
             let out = vtype(&MFVideoFormat_H264).map_err(&e)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, s.video_bitrate).map_err(&e)?;
+            if let Some(k) = keyframe_every {
+                out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, k.max(1)).map_err(&e)?;
+            }
             let video = writer.AddStream(&out).map_err(&e)?;
             writer.SetInputMediaType(video, &vtype(&MFVideoFormat_NV12).map_err(&e)?, None).map_err(&e)?;
+            // キーフレームの間隔は、メディアの種類の指定だけでは効かない符号化器があるので、符号化器にも直接伝える
+            if let Some(k) = keyframe_every {
+                use windows::core::Interface;
+                let mut p = std::ptr::null_mut();
+                if writer.GetServiceForStream(video, &GUID::zeroed(), &ICodecAPI::IID, &mut p).is_ok() && !p.is_null() {
+                    let api = ICodecAPI::from_raw(p);
+                    let v = windows::Win32::System::Variant::VARIANT::from(k.max(1));
+                    let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
+                }
+            }
             let mut audio = None;
             if let Some(rate) = s.sample_rate {
                 let atype = |sub: &GUID, avg: u32| -> windows::core::Result<IMFMediaType> {
@@ -536,6 +561,8 @@ pub fn bgra_to_nv12(bgra: &[u8], w: usize, h: usize, out: &mut [u8]) {
 unsafe impl Send for VideoReader {}
 unsafe impl Send for AudioReader {}
 unsafe impl Send for Exporter {}
+
+pub mod proxy;
 
 #[cfg(test)]
 mod tests;

@@ -553,3 +553,56 @@ fn masks_wipes_and_crossfade_render() {
     assert_eq!(px(&img, 0, 0), (0, 0, 255));
     assert_eq!(px(&img, 95, 95), (255, 0, 0));
 }
+
+#[test]
+fn preview_with_proxy_matches_original_placement() {
+    let d = dir();
+    // SAFETY: このテストの中だけで使う
+    unsafe { std::env::set_var("STUDIO_PROXY_DIR", d.join("proxies")) };
+    let src = d.join("hd.mp4");
+    let (w, h) = (1280u32, 720u32);
+    let mut ex = Exporter::create(&src, &ExportSettings { width: w, height: h, frame_rate: Rate::new(30, 1), video_bitrate: 8_000_000, sample_rate: None, audio_bitrate: 0 }).unwrap();
+    for i in 0..30u32 {
+        // 左半分が赤、右半分が青(境目がフレームごとに右へ 4px)
+        let edge = 600 + i * 4;
+        let v: Vec<u8> = (0..w * h).flat_map(|k| if k % w < edge { [0, 0, 255, 255] } else { [255, 0, 0, 255] }).collect();
+        ex.write_frame(&v).unwrap();
+    }
+    ex.finish().unwrap();
+    studio_media::proxy::make_proxy(&src, |_| true).unwrap();
+    let mut ed = Editor::new(Project::default());
+    ed.execute(SetSettings { width: Some(W), height: Some(H), frame_rate: None, sample_rate: None }, Origin::User).unwrap();
+    let o = ed
+        .transaction(
+            "準備",
+            vec![
+                AddTrack { kind: TrackKind::Video, name: None, index: None, id: None },
+                ImportAsset { name: "hd".into(), path: src.to_string_lossy().into(), kind: studio_media::probe(&src).unwrap(), id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let c = ed.execute(AddClip { track: o.created[0], asset: o.created[1], start: s(0.0), duration: None, source_in: None, id: None }, Origin::User).unwrap().created[0];
+    // 1280x720 の素材を 640x360 の画面に、拡大率 0.25 で置く(画面で 320x180)
+    ed.execute(SetParam { clip: c, param: "scale".into(), value: 0.25 }, Origin::User).unwrap();
+    let mut r = Renderer::new(Gpu::new(None).unwrap());
+    let orig = r.render_bgra(&ed.project, s(0.5)).unwrap();
+    r.set_use_proxies(true);
+    let prox = r.render_bgra(&ed.project, s(0.5)).unwrap();
+    // 描かれた範囲(黒でない所)が同じで、色の境目もほぼ同じ所
+    let extent = |img: &[u8]| {
+        let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
+        for (k, p) in img.chunks_exact(4).enumerate() {
+            if p[0] > 60 || p[2] > 60 {
+                let (x, y) = (k as u32 % W, k as u32 / W);
+                (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
+            }
+        }
+        (x0, x1, y0, y1)
+    };
+    assert_eq!(extent(&orig), extent(&prox));
+    assert_eq!(extent(&orig), (160, 479, 90, 269));
+    let edge = |img: &[u8]| (0..W).find(|&x| img[((180 * W + x) * 4) as usize] > 128).unwrap();
+    let (a, b) = (edge(&orig), edge(&prox));
+    assert!(a.abs_diff(b) <= 1, "境目 {a} / {b}");
+}
