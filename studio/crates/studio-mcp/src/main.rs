@@ -49,7 +49,11 @@ fn tools() -> Value {
         {"name": "undo", "description": "直前の操作を元に戻す", "inputSchema": {"type": "object", "properties": {}}},
         {"name": "redo", "description": "元に戻した操作をやり直す", "inputSchema": {"type": "object", "properties": {}}},
         {"name": "export_video", "description": "MP4(H.264 + AAC)に書き出す。必ず利用者の承認が必要。開始後は export_status で進み具合を確認する",
-         "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string", "description": "書き出し先の .mp4 の絶対パス"}}}},
+         "inputSchema": {"type": "object", "required": ["path"], "properties": {
+             "path": {"type": "string", "description": "書き出し先の .mp4 の絶対パス"},
+             "from": {"type": "number", "description": "(任意)範囲の始まり(秒)。from / to を省略すると全体"},
+             "to": {"type": "number", "description": "(任意)範囲の終わり(秒)"},
+             "quality": {"type": "string", "enum": ["small", "standard", "high"], "description": "(任意)画質。small はファイルが小さい(標準の半分のビットレート)、high は 2 倍"}}}},
         {"name": "export_status", "description": "書き出しの進み具合", "inputSchema": {"type": "object", "properties": {}}},
         {"name": "track_follow", "description": "クリップ(clip)を、その下のトラックの動画上の点の動きに追従させる。点は画面上の位置(画面中央が原点の画素、y は下向き)で、time の時点の画面で指定する。time からクリップの終わりまで追跡し、x / y のキーフレームを設定する。解析は裏で進むので track_status で結果を確認する。render_frame で画面を見て、模様のはっきりした点を選ぶとよい",
          "inputSchema": {"type": "object", "required": ["clip", "x", "y"], "properties": {

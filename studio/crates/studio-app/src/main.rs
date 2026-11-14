@@ -60,7 +60,7 @@ struct Pending {
 
 enum PendingAction {
     Commands { label: String, commands: Vec<Command> },
-    Export(PathBuf),
+    Export(PathBuf, studio_render::ExportOptions),
 }
 
 /// 書き出しの進み具合(別スレッドと共有)。
@@ -136,6 +136,8 @@ struct Studio {
     key_preview: Option<(Id, Option<studio_core::project::ChromaKey>)>,
     /// ミキサーの窓を出すか
     show_mixer: bool,
+    /// 書き出しの設定の窓(範囲 [秒] と画質)
+    export_dialog: Option<(Option<(f64, f64)>, studio_render::Quality)>,
     /// プレビューでプロキシを使うか
     use_proxies: bool,
     /// プロキシを作る順番待ちと、作成中のもの
@@ -214,6 +216,7 @@ impl Studio {
             proxy_job: None,
             proxy_checked: Default::default(),
             show_mixer: std::env::var("STUDIO_SHOW_MIXER").is_ok_and(|v| v == "1"),
+            export_dialog: std::env::var("STUDIO_SHOW_EXPORT").is_ok_and(|v| v == "1").then_some((None, studio_render::Quality::Standard)),
             meters: Default::default(),
             last_track_result: String::new(),
             ai_instruction: String::new(),
@@ -431,15 +434,71 @@ impl Studio {
         }
     }
 
-    fn start_export(&mut self) {
-        if self.export.is_some() {
-            return;
+    /// 書き出しの設定の窓。
+    fn export_window(&mut self, ctx: &egui::Context) {
+        let Some((mut range, mut quality)) = self.export_dialog else { return };
+        let total = self.editor.project.duration().secs_f64();
+        let mut open = true;
+        let mut go = false;
+        let center = ctx.content_rect().center();
+        egui::Window::new("書き出し")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(center)
+            .show(ctx, |ui| {
+            ui.label(format!("{}×{}  {:.3} fps  長さ {:.2} 秒", self.editor.project.settings.width, self.editor.project.settings.height, self.editor.project.settings.frame_rate.fps(), total));
+            ui.add_space(4.0);
+            let mut part = range.is_some();
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut part, false, "全体");
+                ui.radio_value(&mut part, true, "範囲を指定");
+            });
+            if part && range.is_none() {
+                // 選択中のクリップがあればその範囲、無ければ再生位置から最後まで
+                let r = self.selected.and_then(|id| self.editor.project.clip(id)).map(|c| (c.start.secs_f64(), c.end().secs_f64()));
+                range = Some(r.unwrap_or((self.playhead.secs_f64().min(total), total)));
+            }
+            if !part {
+                range = None;
+            }
+            if let Some((a, b)) = range.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(a).range(0.0..=total).speed(0.05).suffix(" 秒").max_decimals(3));
+                    ui.label("〜");
+                    ui.add(egui::DragValue::new(b).range(0.0..=total).speed(0.05).suffix(" 秒").max_decimals(3));
+                    if ui.small_button("再生位置から").clicked() {
+                        *a = self.playhead.secs_f64().min(total);
+                    }
+                    if ui.small_button("再生位置まで").clicked() {
+                        *b = self.playhead.secs_f64().min(total);
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("画質");
+                ui.radio_value(&mut quality, studio_render::Quality::Small, "軽い");
+                ui.radio_value(&mut quality, studio_render::Quality::Standard, "標準");
+                ui.radio_value(&mut quality, studio_render::Quality::High, "高画質");
+            });
+            ui.add_space(6.0);
+            let ok = total > 0.0 && range.is_none_or(|(a, b)| b > a);
+            if ui.add_enabled(ok && self.export.is_none(), egui::Button::new("書き出す…")).clicked() {
+                go = true;
+            }
+        });
+        self.export_dialog = if open && !go { Some((range, quality)) } else { None };
+        if go {
+            let Some(path) = rfd::FileDialog::new().add_filter("MP4 動画", &["mp4"]).set_file_name("output.mp4").save_file() else { return };
+            let opt = studio_render::ExportOptions { range: range.map(|(a, b)| (Time::from_secs_f64(a), Time::from_secs_f64(b))), quality };
+            self.start_export_to(path, opt);
         }
-        let Some(path) = rfd::FileDialog::new().add_filter("MP4 動画", &["mp4"]).set_file_name("output.mp4").save_file() else { return };
-        self.start_export_to(path);
     }
 
-    fn start_export_to(&mut self, path: PathBuf) {
+    fn start_export_to(&mut self, path: PathBuf, opt: studio_render::ExportOptions) {
         if self.export.is_some() {
             return;
         }
@@ -453,7 +512,7 @@ impl Studio {
         };
         let (done, total, cancel, result) = (job.done.clone(), job.total.clone(), job.cancel.clone(), job.result.clone());
         std::thread::spawn(move || {
-            let r = studio_render::export(&project, &path, |pr| {
+            let r = studio_render::export_with(&project, &path, &opt, |pr| {
                 done.store(pr.frame, Ordering::Relaxed);
                 total.store(pr.total, Ordering::Relaxed);
                 !cancel.load(Ordering::Relaxed)
@@ -611,8 +670,28 @@ impl Studio {
                 if path.exists() {
                     summary.push("このファイルは既にあり、上書きされます".into());
                 }
+                let from = params.get("from").and_then(|x| x.as_f64());
+                let to = params.get("to").and_then(|x| x.as_f64());
+                let range = match (from, to) {
+                    (None, None) => None,
+                    (a, b) => {
+                        let (a, b) = (a.unwrap_or(0.0), b.unwrap_or(self.editor.project.duration().secs_f64()));
+                        if b <= a {
+                            return Done(Err(format!("範囲 {a}〜{b} 秒が空です")));
+                        }
+                        summary.push(format!("範囲: {a:.3}〜{b:.3} 秒"));
+                        Some((Time::from_secs_f64(a), Time::from_secs_f64(b)))
+                    }
+                };
+                let quality = match params.get("quality").and_then(|x| x.as_str()).unwrap_or("standard") {
+                    "small" => studio_render::Quality::Small,
+                    "high" => studio_render::Quality::High,
+                    "standard" => studio_render::Quality::Standard,
+                    q => return Done(Err(format!("quality {q:?} は small / standard / high のどれかにしてください"))),
+                };
+                summary.push(format!("画質: {}", match quality { studio_render::Quality::Small => "軽い", studio_render::Quality::Standard => "標準", studio_render::Quality::High => "高画質" }));
                 // ファイルを書くので、権限の設定に関わらず必ず確認する
-                Handled::NeedsApproval("動画の書き出し".into(), summary, PendingAction::Export(path))
+                Handled::NeedsApproval("動画の書き出し".into(), summary, PendingAction::Export(path, studio_render::ExportOptions { range, quality }))
             }
             "track_follow" => {
                 if self.mcp_mode == McpMode::ReadOnly {
@@ -724,8 +803,8 @@ impl Studio {
             } else {
                 match p.action {
                     PendingAction::Commands { label, commands } => self.apply_external(&label, commands),
-                    PendingAction::Export(path) => {
-                        self.start_export_to(path.clone());
+                    PendingAction::Export(path, opt) => {
+                        self.start_export_to(path.clone(), opt);
                         Ok(json!(format!("書き出しを開始しました: {}。export_status で進み具合を確認できます", path.display())))
                     }
                 }
@@ -1117,6 +1196,7 @@ impl Studio {
         self.process_requests();
         self.approval_window(&ctx);
         self.mixer_window(&ctx);
+        self.export_window(&ctx);
         if self.pending.is_empty() {
             self.handle_keys(&ctx);
         }
@@ -1178,7 +1258,7 @@ impl Studio {
                 }
                 ui.separator();
                 if ui.add_enabled(self.export.is_none(), egui::Button::new("書き出し")).clicked() {
-                    self.start_export();
+                    self.export_dialog = Some((None, studio_render::Quality::Standard));
                 }
                 ui.separator();
                 ui.label("外部からの操作:");

@@ -466,27 +466,61 @@ pub struct Progress {
 }
 
 /// プロジェクトを MP4(H.264 + AAC)に書き出す。`progress` が false を返したら中止する。
-pub fn export(project: &Project, path: &Path, mut progress: impl FnMut(Progress) -> bool) -> Result<(), String> {
+pub fn export(project: &Project, path: &Path, progress: impl FnMut(Progress) -> bool) -> Result<(), String> {
+    export_with(project, path, &ExportOptions::default(), progress)
+}
+
+/// 書き出しの画質。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Quality {
+    /// ファイルを小さく(標準の半分のビットレート)
+    Small,
+    #[default]
+    Standard,
+    /// 高画質(標準の 2 倍)
+    High,
+}
+
+/// 書き出しの範囲と画質。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExportOptions {
+    /// 範囲(無ければ全体)。始まりはフレームの境界に合わせる
+    pub range: Option<(Time, Time)>,
+    pub quality: Quality,
+}
+
+/// 範囲と画質を指定して書き出す。
+pub fn export_with(project: &Project, path: &Path, opt: &ExportOptions, mut progress: impl FnMut(Progress) -> bool) -> Result<(), String> {
     let s = &project.settings;
-    let total = s.frame_rate.time_to_frame(project.duration() + Time(s.frame_rate.frame_duration().0 - 1));
+    let fd = s.frame_rate.frame_duration();
+    let (from, to) = opt.range.unwrap_or((Time::ZERO, project.duration()));
+    let from = s.frame_rate.frame_to_time(s.frame_rate.time_to_frame(from.max(Time::ZERO)));
+    let to = to.min(project.duration());
+    let first = s.frame_rate.time_to_frame(from);
+    let total = s.frame_rate.time_to_frame(to + Time(fd.0 - 1)) - first;
     if total <= 0 {
-        return Err("書き出す内容がありません".into());
+        return Err("書き出す内容がありません(範囲を確かめてください)".into());
     }
     let mut renderer = Renderer::new(Gpu::new(None)?);
     let mut mixer = Mixer::new(s.sample_rate);
-    let bitrate = ((s.width as u64 * s.height as u64 * 6) as f64 * s.frame_rate.fps() / 30.0).clamp(2e6, 60e6) as u32;
+    let k = match opt.quality {
+        Quality::Small => 0.5,
+        Quality::Standard => 1.0,
+        Quality::High => 2.0,
+    };
+    let bitrate = ((s.width as u64 * s.height as u64 * 6) as f64 * s.frame_rate.fps() / 30.0 * k).clamp(1e6, 120e6) as u32;
     let mut ex = Exporter::create(
         path,
         &ExportSettings { width: s.width, height: s.height, frame_rate: s.frame_rate, video_bitrate: bitrate, sample_rate: Some(s.sample_rate), audio_bitrate: 192_000 },
     )
     .map_err(|e| e.to_string())?;
     for n in 0..total {
-        let t = s.frame_rate.frame_to_time(n);
+        let t = s.frame_rate.frame_to_time(first + n);
         let bgra = renderer.render_bgra(project, t)?;
         ex.write_frame(&bgra).map_err(|e| e.to_string())?;
         // このフレームの区間に入る標本(端数はフレームの境界で正確に分ける)
         let a = time_to_sample(t, s.sample_rate);
-        let b = time_to_sample(s.frame_rate.frame_to_time(n + 1), s.sample_rate);
+        let b = time_to_sample(s.frame_rate.frame_to_time(first + n + 1), s.sample_rate);
         ex.write_audio(&mixer.mix(project, a, (b - a) as usize)).map_err(|e| e.to_string())?;
         if !progress(Progress { frame: n + 1, total }) {
             return Err("中止しました".into());

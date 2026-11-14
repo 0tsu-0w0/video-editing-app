@@ -838,3 +838,26 @@ fn frame_blend_mixes_neighbouring_frames() {
     let img = r.render_bgra(&ed.project, Time::from_secs_f64(21.0 / 30.0)).unwrap();
     assert!((100..=160).contains(&bit0(&img)), "スロー {}", bit0(&img));
 }
+
+#[test]
+fn export_range_and_quality() {
+    // 同じ名前の素材を作るテストと並んで動くので、別のフォルダにする
+    let d = dir().join("range");
+    std::fs::create_dir_all(&d).unwrap();
+    let (p, _) = project(&d);
+    let out_full = d.join("range_std.mp4");
+    let out_small = d.join("range_small.mp4");
+    let opt = ExportOptions { range: Some((s(1.0), s(2.5))), quality: Quality::Standard };
+    export_with(&p, &out_full, &opt, |_| true).unwrap();
+    export_with(&p, &out_small, &ExportOptions { quality: Quality::Small, ..opt.clone() }, |_| true).unwrap();
+    // 長さは 1.5 秒、最初のフレームは素材の 1 秒目
+    let mut r = VideoReader::open(&out_full).unwrap();
+    assert!((r.duration.secs_f64() - 1.5).abs() < 0.05, "{}", r.duration);
+    let f = r.frame_at(Time::ZERO).unwrap();
+    assert_eq!(read_index(&f.bgra, f.width), FPS);
+    // 軽い画質はファイルが小さい
+    let (a, b) = (std::fs::metadata(&out_full).unwrap().len(), std::fs::metadata(&out_small).unwrap().len());
+    assert!(b < a, "{b} < {a}");
+    // 範囲が空なら断る
+    assert!(export_with(&p, &d.join("x.mp4"), &ExportOptions { range: Some((s(9.0), s(10.0))), ..Default::default() }, |_| true).is_err());
+}
