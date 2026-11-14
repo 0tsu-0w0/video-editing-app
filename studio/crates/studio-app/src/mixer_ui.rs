@@ -39,8 +39,9 @@ fn meter(ui: &mut egui::Ui, (l, r): (f32, f32), height: f32) {
 impl Studio {
     /// 連続した操作(スライダー)を 1 つの Undo にまとめて実行する。
     fn mix_edit(&mut self, key: String, cmd: Command) {
-        if let Err(e) = self.editor.transaction_merged("ミキサー", vec![cmd], Origin::User, &key, Duration::from_secs(1)) {
-            self.status = format!("できませんでした: {}", e.error.message);
+        match self.editor.transaction_merged("ミキサー", vec![cmd], Origin::User, &key, Duration::from_secs(1)) {
+            Ok(o) => self.status = o.summary.join(" / "),
+            Err(e) => self.status = format!("できませんでした: {}", e.error.message),
         }
     }
 
@@ -95,7 +96,9 @@ impl Studio {
                                     }
                                 });
                                 ui.horizontal(|ui| {
-                                    meter(ui, self.meters.get(&id.0).copied().unwrap_or_default(), 150.0);
+                                    // 縦のフェーダーを長くして、細かく動かせるようにする
+                                    ui.spacing_mut().slider_width = 200.0;
+                                    meter(ui, self.meters.get(&id.0).copied().unwrap_or_default(), 200.0);
                                     let mut g = t.audio.gain_db;
                                     if ui.add(egui::Slider::new(&mut g, -60.0..=12.0).vertical().suffix(" dB").fixed_decimals(1)).on_hover_text("音量").changed() {
                                         edits.push((format!("gain:{id}"), Command::SetTrackAudio { track: id, gain_db: Some(g), pan: None, solo: None }));
@@ -189,7 +192,8 @@ impl Studio {
                         ui.vertical(|ui| {
                             ui.strong("全体");
                             ui.horizontal(|ui| {
-                                meter(ui, self.meters.get(&0).copied().unwrap_or_default(), 150.0);
+                                ui.spacing_mut().slider_width = 200.0;
+                                meter(ui, self.meters.get(&0).copied().unwrap_or_default(), 200.0);
                                 let mut g = project.settings.master_gain_db;
                                 if ui.add(egui::Slider::new(&mut g, -60.0..=12.0).vertical().suffix(" dB").fixed_decimals(1)).changed() {
                                     edits.push(("master".into(), Command::SetMasterGain { gain_db: g }));

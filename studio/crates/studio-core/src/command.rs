@@ -714,7 +714,11 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             }
             let side = if edge == Edge::In { "始まり" } else { "終わり" };
             let s = match transition {
-                Some(tr) => format!("クリップ {clip} の{side}に {:?} のトランジション({})", tr.kind, tr.duration),
+                Some(tr) => format!(
+                    "クリップ {clip} の{side}に「{}」のトランジション({})",
+                    TRANSITION_KINDS.iter().find(|k| k.0 == tr.kind).map_or("?", |k| k.2),
+                    tr.duration
+                ),
                 None => format!("クリップ {clip} の{side}のトランジションを外す"),
             };
             done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)

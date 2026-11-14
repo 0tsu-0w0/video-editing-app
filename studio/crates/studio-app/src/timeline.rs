@@ -292,7 +292,9 @@ impl Timeline {
             if let Some(pp) = resp.interact_pointer_pos() {
                 match hovered_clip {
                     Some((id, _)) => actions.push(Action::Select(Some(id))),
-                    None if pp.y < ruler.bottom() || pp.x > rect.left() + HEADER_W => {
+                    // 目盛りのクリックは再生位置だけ動かす(選択はそのまま)
+                    None if pp.y < ruler.bottom() => actions.push(Action::Seek(p.settings.frame_rate.snap(self.t_of(rect, pp.x)))),
+                    None if pp.x > rect.left() + HEADER_W => {
                         actions.push(Action::Select(None));
                         actions.push(Action::Seek(p.settings.frame_rate.snap(self.t_of(rect, pp.x))));
                     }

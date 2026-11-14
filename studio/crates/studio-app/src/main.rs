@@ -244,6 +244,14 @@ impl Studio {
         }
     }
 
+    /// 連続した変更をまとめて実行し、結果をステータスに出す。
+    fn run_merged(&mut self, label: &str, cmds: Vec<Command>, key: &str, secs: u64) {
+        match self.editor.transaction_merged(label, cmds, Origin::User, key, std::time::Duration::from_secs(secs)) {
+            Ok(o) => self.status = o.summary.join(" / "),
+            Err(e) => self.status = format!("できませんでした: {}", e.error.message),
+        }
+    }
+
     /// プロキシを作る順番待ちに入れる。
     fn queue_proxy(&mut self, asset: Id) {
         if self.proxy_job.as_ref().is_some_and(|j| j.asset == asset) || self.proxy_queue.contains(&asset) {
@@ -1227,7 +1235,7 @@ impl Studio {
             }
         });
 
-        egui::Panel::right("inspector").resizable(true).default_size(260.0).show(ui, |ui| self.inspector(ui));
+        egui::Panel::right("inspector").resizable(true).default_size(300.0).size_range(220.0..=460.0).show(ui, |ui| self.inspector(ui));
 
         egui::CentralPanel::default().show(ui, |ui| self.preview(ui));
     }
@@ -1298,9 +1306,7 @@ impl Studio {
             });
             if changed {
                 let cmd = SetText { asset: aid, text: Some(t), font: Some(st.font), size: Some(st.size), color: Some(st.color), outline: Some(st.outline), outline_color: Some(st.outline_color), align: Some(st.align) };
-                if let Err(e) = self.editor.transaction_merged("文字の変更", vec![cmd], Origin::User, &format!("text:{aid}"), std::time::Duration::from_secs(2)) {
-                    self.status = format!("できませんでした: {}", e.error.message);
-                }
+                self.run_merged("文字の変更", vec![cmd], &format!("text:{aid}"), 2);
             }
             ui.separator();
         }
@@ -1317,9 +1323,7 @@ impl Studio {
                 let (fi, fo) = (Time::from_secs_f64(fi), Time::from_secs_f64(fo));
                 // 合計が長さを超えないよう、動かした方に合わせてもう一方を縮める
                 let (fi, fo) = if a { (fi, fo.min(clip.duration - fi)) } else { (fi.min(clip.duration - fo), fo) };
-                if let Err(e) = self.editor.transaction_merged("フェード", vec![SetFade { clip: id, fade_in: Some(fi), fade_out: Some(fo) }], Origin::User, &format!("fade:{id}"), std::time::Duration::from_secs(2)) {
-                    self.status = format!("できませんでした: {}", e.error.message);
-                }
+                self.run_merged("フェード", vec![SetFade { clip: id, fade_in: Some(fi), fade_out: Some(fo) }], &format!("fade:{id}"), 2);
             }
         });
         let on_video_track = self.editor.project.find_clip(id).is_some_and(|(ti, _)| self.editor.project.tracks[ti].kind == TrackKind::Video);
@@ -1333,7 +1337,7 @@ impl Studio {
                     ui.label(label);
                     let name = cur.and_then(|t| TRANSITION_KINDS.iter().find(|k| k.0 == t.kind)).map_or("なし", |k| k.2);
                     let mut pick = cur.map(|t| t.kind);
-                    egui::ComboBox::from_id_salt(("tr", id, label)).selected_text(name).width(170.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(("tr", id, label)).selected_text(name).width(130.0).show_ui(ui, |ui| {
                         ui.selectable_value(&mut pick, None, "なし");
                         for (k, _, n) in TRANSITION_KINDS {
                             ui.selectable_value(&mut pick, Some(k), n);
@@ -1350,9 +1354,7 @@ impl Studio {
                 });
             }
             if let Some((key, c)) = tcmd {
-                if let Err(e) = self.editor.transaction_merged("トランジション", vec![c], Origin::User, &key, std::time::Duration::from_secs(2)) {
-                    self.status = format!("できませんでした: {}", e.error.message);
-                }
+                self.run_merged("トランジション", vec![c], &key, 2);
             }
             // マスク
             use studio_core::project::{Mask, MaskShape};
@@ -1395,6 +1397,10 @@ impl Studio {
         let has_mask = self.editor.project.clip(id).is_some_and(|c| c.mask.is_some());
         let clip = self.editor.project.clip(id).cloned().unwrap_or(clip);
         let is_model = matches!(self.editor.project.assets.get(&clip.asset).map(|a| &a.kind), Some(AssetKind::Model { .. }));
+        let src_extent = match self.editor.project.assets.get(&clip.asset).map(|a| &a.kind) {
+            Some(AssetKind::Video { width, height, .. }) | Some(AssetKind::Image { width, height }) => (*width).max(*height) as f64,
+            _ => self.editor.project.settings.width.max(self.editor.project.settings.height) as f64,
+        };
         let on_audio = self.editor.project.find_clip(id).is_some_and(|(ti, _)| self.editor.project.tracks[ti].kind == TrackKind::Audio);
         let mut commit: Option<Command> = None;
         // 映像トラックでは見た目の項目、音声トラックでは音量・パンだけを出す(列をそろえる)
@@ -1417,7 +1423,8 @@ impl Studio {
                     "scale" => 0.0..=8.0,
                     "rotation" | "rot_x" | "rot_y" => -360.0..=360.0,
                     "mask_x" | "mask_y" => -4000.0..=4000.0,
-                    "mask_w" | "mask_h" => 0.0..=8000.0,
+                    // マスクの大きさは素材の大きさに合わせた範囲にする(細かく動かせるように)
+                    "mask_w" | "mask_h" => 0.0..=(src_extent * 1.5).max(100.0),
                     "mask_feather" => 0.0..=400.0,
                     "volume" => 0.0..=4.0,
                     _ => lo..=hi,
@@ -1515,12 +1522,11 @@ impl Studio {
                 }
             });
             if pins > 0 {
-                ui.horizontal(|ui| {
-                    ui.label(format!("四隅で変形中(キー {pins} 個)。位置・拡大・回転は使われません"));
-                    if ui.button("外す").clicked() {
-                        self.run("四隅を外す", vec![Command::SetPin { clip: id, keys: vec![] }]);
-                    }
-                });
+                ui.label(format!("四隅で変形中(キー {pins} 個)"));
+                ui.weak("位置・拡大・回転は使われません");
+                if ui.button("四隅の変形を外す").clicked() {
+                    self.run("四隅を外す", vec![Command::SetPin { clip: id, keys: vec![] }]);
+                }
             }
         }
         if ui.button("このクリップを削除").clicked() {
