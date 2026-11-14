@@ -183,6 +183,8 @@ pub enum Command {
     /// トランジションを付ける・外す(edge: "in" は始まり、"out" は終わり。transition が無ければ外す)
     /// 再生速度を変える。同じ素材の範囲を使うよう、長さ・キーフレーム・フェードなどの時刻も合わせて伸び縮みする
     SetSpeed { clip: Id, speed: f64 },
+    /// 逆再生にする・戻す(素材の同じ範囲を、終わりから始まりへ再生する)
+    SetReverse { clip: Id, reverse: bool },
     /// クロマキーを付ける・外す(key が無ければ外す)
     SetChromaKey {
         clip: Id,
@@ -248,6 +250,38 @@ impl Command {
         )
     }
 
+    /// 画面に出す日本語の名前(取り消し・やり直しの表示用)。
+    pub fn label(&self) -> &'static str {
+        match self.name() {
+            "add_track" => "トラックの追加",
+            "remove_track" => "トラックの削除",
+            "rename_track" => "トラック名の変更",
+            "move_track" => "トラックの並べ替え",
+            "set_track_flags" => "トラックの設定",
+            "set_track_audio" | "set_track_effects" | "set_master_gain" => "ミキサー",
+            "import_asset" => "素材の読み込み",
+            "remove_asset" => "素材の削除",
+            "add_clip" => "クリップの追加",
+            "remove_clip" => "クリップの削除",
+            "move_clip" => "クリップの移動",
+            "trim_clip" => "クリップの長さの変更",
+            "split_clip" => "分割",
+            "set_fade" => "フェード",
+            "set_text" => "文字",
+            "set_param" => "値の変更",
+            "set_key" => "キーフレーム",
+            "remove_key" => "キーフレームの削除",
+            "set_settings" => "プロジェクトの設定",
+            "set_pin" => "四隅の貼り付け",
+            "set_mask" => "マスク",
+            "set_transition" => "トランジション",
+            "set_chroma_key" => "クロマキー",
+            "set_speed" => "速度",
+            "set_reverse" => "逆再生",
+            n => n,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Command::AddTrack { .. } => "add_track",
@@ -272,6 +306,7 @@ impl Command {
             Command::SetTransition { .. } => "set_transition",
             Command::SetChromaKey { .. } => "set_chroma_key",
             Command::SetSpeed { .. } => "set_speed",
+            Command::SetReverse { .. } => "set_reverse",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
             Command::RemoveKey { .. } => "remove_key",
@@ -508,7 +543,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 (None, None) => Time::from_secs_f64(5.0),
             };
             let id = take_id(p, id)?;
-            let clip = Clip { id, asset, start, duration, source_in, speed: 1.0, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
+            let clip = Clip { id, asset, start, duration, source_in, speed: 1.0, reverse: false, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
             check_clip_time(p, &clip)?;
             insert_clip(track_mut(p, track)?, clip)?;
             done(
@@ -611,7 +646,11 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             let left = at - c.start;
             t.clips[ci].duration = left;
             // 右側のキーフレームは、新しいクリップの開始基準に付け直す
-            let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: c.source_at(left), fade_in: Time::ZERO, ..c.clone() };
+            let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: if c.reverse { c.source_in } else { c.source_at(left) }, fade_in: Time::ZERO, ..c.clone() };
+            // 逆再生では、左側が素材の後ろの部分を使う
+            if c.reverse {
+                t.clips[ci].source_in = c.source_in + scale_time(c.duration - left, c.speed);
+            }
             right.fade_out = right.fade_out.min(right.duration);
             right.transition_in = None;
             if right.transition_out.is_some_and(|t| t.duration > right.duration) {
@@ -785,6 +824,15 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 None,
                 format!("クリップ {clip} の速度を {speed} 倍に(長さ {})", c.duration),
             )
+        }
+        SetReverse { clip, reverse } => {
+            let (t, ci) = clip_mut(p, clip)?;
+            unlocked(t)?;
+            let tid = t.id;
+            let old = t.clips[ci].clone();
+            t.clips[ci].reverse = reverse;
+            let s = format!("クリップ {clip} を{}", if reverse { "逆再生にする" } else { "通常の再生に戻す" });
+            done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)
         }
         SetChromaKey { clip, key } => {
             let (t, ci) = clip_mut(p, clip)?;

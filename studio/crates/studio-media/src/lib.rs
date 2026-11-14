@@ -160,7 +160,12 @@ pub struct VideoReader {
     cursor: Time,
     eof: bool,
     pub duration: Time,
+    /// シークしてから目的のフレームまでに読んだフレーム(逆再生で、同じ区間を何度も読み直さないため)
+    back: std::collections::VecDeque<Frame>,
 }
+
+/// 逆再生用に覚えておくフレームの量(バイト)。
+const BACK_CACHE_BYTES: usize = 192 << 20;
 
 impl VideoReader {
     pub fn open(path: &Path) -> R<Self> {
@@ -178,7 +183,7 @@ impl VideoReader {
             let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or((w * 4) as i32);
             let rate = cur.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(pack(30, 1));
             let rate = Rate::new(((rate >> 32) as u32).max(1), (rate as u32).max(1));
-            Ok(Self { reader, width: w, height: h, stride, frame_dur: rate.frame_duration(), current: None, cursor: Time::ZERO, eof: false, duration })
+            Ok(Self { reader, width: w, height: h, stride, frame_dur: rate.frame_duration(), current: None, cursor: Time::ZERO, eof: false, duration, back: Default::default() })
         }
     }
 
@@ -240,7 +245,14 @@ impl VideoReader {
         }
         // 少し先なら読み進める。後ろや遠い先ならシークする。
         let near_ahead = self.current.as_ref().is_some_and(|f| t >= f.time) && t < self.cursor + Time::from_secs_f64(2.0);
-        if !near_ahead || self.eof {
+        if !near_ahead {
+            // 後ろへ戻るときは、前にシークしたときに覚えたフレームを使う
+            if let Some(i) = self.back.iter().position(|f| t >= f.time && t < f.time + f.duration) {
+                return Ok(&self.back[i]);
+            }
+        }
+        let sought = !near_ahead || self.eof;
+        if sought {
             seek(&self.reader, t)?;
             self.eof = false;
             self.current = None;
@@ -249,6 +261,15 @@ impl VideoReader {
             match self.read_next()? {
                 Some(f) => {
                     let hit = t < f.time + f.duration;
+                    if sought {
+                        let size = f.bgra.len().max(1);
+                        while !self.back.is_empty() && (self.back.len() + 1) * size > BACK_CACHE_BYTES {
+                            self.back.pop_front();
+                        }
+                        if !self.back.iter().any(|b| b.time == f.time) {
+                            self.back.push_back(f.clone());
+                        }
+                    }
                     self.current = Some(f);
                     if hit {
                         break;

@@ -575,3 +575,31 @@ fn speed_rescales_clip_keys_and_source_and_undoes() {
     assert_eq!(ed.project.tracks, before.tracks);
     let _ = ed.project.clip(c).unwrap().source_len();
 }
+
+#[test]
+fn reverse_maps_time_backwards_and_split_keeps_picture() {
+    let (mut ed, v1, _v2, _a1, movie, _img) = setup();
+    let c = ed.execute(AddClip { track: v1, asset: movie, start: s(1.0), duration: Some(s(4.0)), source_in: Some(s(2.0)), id: None }, Origin::User).unwrap().created[0];
+    ed.execute(SetReverse { clip: c, reverse: true }, Origin::User).unwrap();
+    let src = |p: &Project, t: f64| layers_at(p, s(t)).into_iter().next().unwrap().source_time;
+    // 素材の 2〜6 秒を逆に: 始まりは 6 秒の直前、終わりは 2 秒付近
+    assert!((src(&ed.project, 1.0).secs_f64() - 6.0).abs() < 1e-6 && src(&ed.project, 1.0) < s(6.0));
+    assert!((src(&ed.project, 4.0).secs_f64() - 3.0).abs() < 1e-6);
+    // 2 倍速と組み合わせ(長さ 2 秒): 1.5 秒目(クリップの 0.5 秒)は素材の 5 秒
+    ed.execute(SetSpeed { clip: c, speed: 2.0 }, Origin::User).unwrap();
+    assert!((src(&ed.project, 1.5).secs_f64() - 5.0).abs() < 1e-6);
+    ed.undo();
+    // 分割しても、どの時刻でも同じ素材の時刻が出る
+    let before: Vec<Time> = (0..40).map(|i| src(&ed.project, 1.0 + i as f64 * 0.1)).collect();
+    ed.execute(SplitClip { clip: c, at: s(2.5), new_id: None }, Origin::User).unwrap();
+    let after: Vec<Time> = (0..40).map(|i| src(&ed.project, 1.0 + i as f64 * 0.1)).collect();
+    assert_eq!(before, after);
+    assert!(ed.project.tracks[0].clips.iter().all(|c| c.reverse));
+    ed.undo();
+    ed.execute(SetReverse { clip: c, reverse: false }, Origin::User).unwrap();
+    assert_eq!(src(&ed.project, 1.0), s(2.0));
+    ed.undo();
+    assert!(ed.project.clip(c).unwrap().reverse);
+    let back: Project = serde_json::from_str(&serde_json::to_string(&ed.project).unwrap()).unwrap();
+    assert_eq!(back, ed.project);
+}

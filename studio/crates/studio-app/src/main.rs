@@ -1180,7 +1180,7 @@ impl Studio {
                         Action::Seek(t) => self.seek(t),
                         Action::Select(s) => self.selected = s,
                         Action::Command(c) => {
-                            let label = c.name().to_string();
+                            let label = c.label().to_string();
                             self.run(&label, vec![c]);
                         }
                     }
@@ -1360,6 +1360,10 @@ impl Studio {
                 if let Some(v) = pick.filter(|v| *v != clip.speed) {
                     self.run("速度", vec![Command::SetSpeed { clip: id, speed: v }]);
                 }
+                let mut rev = clip.reverse;
+                if ui.checkbox(&mut rev, "逆再生").on_hover_text("素材の同じ範囲を、終わりから始まりへ再生します").changed() {
+                    self.run("逆再生", vec![Command::SetReverse { clip: id, reverse: rev }]);
+                }
             })
             .response
             .on_hover_text("同じ素材の範囲を、速度に合わせた長さで再生します(2 倍なら長さが半分)。音声は高さも変わります");
@@ -1473,7 +1477,7 @@ impl Studio {
             }
         }
         if let Some(c) = commit {
-            let l = c.name().to_string();
+            let l = c.label().to_string();
             self.run(&l, vec![c]);
         }
         ui.separator();

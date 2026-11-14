@@ -281,12 +281,15 @@ impl Mixer {
                 continue;
             }
             let src_start = time_to_sample(span.source_start, self.rate);
-            let buf = if span.speed == 1.0 {
+            let buf = if span.speed == 1.0 && !span.reverse {
                 let Ok(b) = reader.read(src_start, n) else { continue };
                 b
             } else {
-                // 速度が違うときは、必要な長さを読んで直線補間で詰める・伸ばす(音の高さも変わる)
-                let pos0 = span.source_start.secs_f64() * self.rate as f64;
+                // 速度が違うときは、必要な長さを読んで直線補間で詰める・伸ばす(音の高さも変わる)。
+                // 逆再生では source_start が範囲の終わりなので、そこから手前の範囲を読んで、最後に前後を入れ替える
+                let len = n as f64 * span.speed;
+                let hi = span.source_start.secs_f64() * self.rate as f64;
+                let pos0 = if span.reverse { (hi - len).max(0.0) } else { hi };
                 let base = pos0.floor() as i64;
                 let need = ((n as f64) * span.speed).ceil() as usize + 2;
                 let Ok(src) = reader.read(base, need) else { continue };
@@ -300,6 +303,13 @@ impl Mixer {
                     for ch in 0..2 {
                         b[k * 2 + ch] = at(i, ch) * (1.0 - f) + at(i + 1, ch) * f;
                     }
+                }
+                if span.reverse {
+                    let mut r = vec![0.0f32; n * 2];
+                    for k in 0..n {
+                        r[k * 2..k * 2 + 2].copy_from_slice(&b[(n - 1 - k) * 2..(n - 1 - k) * 2 + 2]);
+                    }
+                    b = r;
                 }
                 b
             };

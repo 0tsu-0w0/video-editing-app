@@ -732,3 +732,55 @@ fn speed_changes_video_frame_and_audio_pitch() {
     let (pl, _) = peak_in(&buf, 2.1, 2.9);
     assert!(pl < 1e-3, "{pl}");
 }
+
+#[test]
+fn reverse_plays_frames_and_audio_backwards() {
+    let d = dir();
+    let video = d.join("rev_src.mp4");
+    make_source(&video);
+    let wav = d.join("beep_start.wav");
+    // 最初の 0.5 秒だけ鳴る音
+    write_wav(&wav, 3.0, |t| if t < 0.5 { (t * 500.0 * std::f64::consts::TAU).sin() as f32 * 0.5 } else { 0.0 });
+    let mut ed = Editor::new(Project::default());
+    ed.execute(SetSettings { width: Some(W), height: Some(H), frame_rate: Some(Rate::new(FPS, 1)), sample_rate: None }, Origin::User).unwrap();
+    let o = ed
+        .transaction(
+            "準備",
+            vec![
+                AddTrack { kind: TrackKind::Video, name: None, index: None, id: None },
+                AddTrack { kind: TrackKind::Audio, name: None, index: None, id: None },
+                ImportAsset { name: "v".into(), path: video.to_string_lossy().into(), kind: studio_media::probe(&video).unwrap(), id: None },
+                ImportAsset { name: "a".into(), path: wav.to_string_lossy().into(), kind: studio_media::probe(&wav).unwrap(), id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [tv, ta, av, aa] = o.created[..] else { panic!() };
+    let o = ed
+        .transaction(
+            "配置",
+            vec![
+                AddClip { track: tv, asset: av, start: s(0.0), duration: None, source_in: None, id: None },
+                AddClip { track: ta, asset: aa, start: s(0.0), duration: None, source_in: None, id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [cv, ca] = o.created[..] else { panic!() };
+    ed.execute(SetReverse { clip: cv, reverse: true }, Origin::User).unwrap();
+    ed.execute(SetReverse { clip: ca, reverse: true }, Origin::User).unwrap();
+    // 映像: 1 フレームずつ進めると、素材のフレーム番号が 1 ずつ減る(最初は最後のフレーム)
+    let mut r = Renderer::new(Gpu::new(None).unwrap());
+    let last = FPS * SECS - 1;
+    let t0 = std::time::Instant::now();
+    for i in 0..(FPS * 2) {
+        let t = Time::from_secs_f64((i as f64 + 0.5) / FPS as f64);
+        let img = r.render_bgra(&ed.project, t).unwrap();
+        assert_eq!(read_index(&img, W), last - i, "{i} フレーム目");
+    }
+    eprintln!("逆再生 {} フレーム: {:?}", FPS * 2, t0.elapsed());
+    // 音声: 鳴るのは最後の 0.5 秒(2.5〜3 秒)
+    let buf = mix_all(&ed.project);
+    assert!(peak_in(&buf, 0.1, 2.4).0 < 1e-3);
+    assert!(peak_in(&buf, 2.55, 2.95).0 > 0.3);
+}

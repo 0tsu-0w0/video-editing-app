@@ -448,6 +448,9 @@ pub struct Clip {
     /// 再生速度(1 = 等速、2 = 2 倍速、0.5 = スロー)。音声は高さも変わる
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub speed: f64,
+    /// 逆再生(素材の同じ範囲を、終わりから始まりへ)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reverse: bool,
     #[serde(default)]
     pub params: ClipParams,
     /// フェードイン・フェードアウトの長さ(映像は不透明度、音声は音量に効く)
@@ -653,7 +656,12 @@ fn is_zero(t: &Time) -> bool {
 impl Clip {
     /// クリップの開始から local の所で表示する素材の時刻。
     pub fn source_at(&self, local: Time) -> Time {
-        self.source_in + scale_time(local, self.speed)
+        if self.reverse {
+            // 終わりのフレームから始める(範囲の終わりちょうどは次のフレームなので、少し手前)
+            (self.source_in + scale_time(self.duration - local, self.speed) - Time(1)).max(self.source_in)
+        } else {
+            self.source_in + scale_time(local, self.speed)
+        }
     }
     /// クリップ全体で使う素材の長さ。
     pub fn source_len(&self) -> Time {

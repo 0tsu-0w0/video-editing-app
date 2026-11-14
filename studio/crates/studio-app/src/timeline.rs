@@ -27,7 +27,31 @@ struct Drag {
     duration: Time,
     source_in: Time,
     speed: f64,
+    reverse: bool,
+    /// 素材の、使っている範囲より後ろの残り(動画・音声のみ)
+    tail: Option<Time>,
     track: usize,
+}
+
+impl Drag {
+    /// 左端を伸ばせる限界(素材の残りまで)
+    fn start_min(&self) -> Time {
+        let room = if self.reverse { self.tail.unwrap_or(Time::ZERO) } else { self.source_in };
+        self.start - scale_time(room, 1.0 / self.speed)
+    }
+    /// 右端を伸ばせる限界
+    fn end_max(&self) -> Option<Time> {
+        let room = if self.reverse { Some(self.source_in) } else { self.tail };
+        room.map(|r| self.start + self.duration + scale_time(r, 1.0 / self.speed))
+    }
+    /// 左端を shift だけ動かしたときの素材の使用開始位置
+    fn source_after_trim_start(&self, shift: Time) -> Time {
+        if self.reverse { self.source_in } else { (self.source_in + scale_time(shift, self.speed)).max(Time::ZERO) }
+    }
+    /// 右端を delta だけ動かしたときの素材の使用開始位置
+    fn source_after_trim_end(&self, delta: Time) -> Option<Time> {
+        self.reverse.then(|| (self.source_in - scale_time(delta, self.speed)).max(Time::ZERO))
+    }
 }
 
 pub struct Timeline {
@@ -138,6 +162,10 @@ impl Timeline {
         // トラックとクリップ
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let mut hovered_clip: Option<(Id, DragKind)> = None;
+        // ドラッグを始めた位置(押した位置)にあるクリップ。ドラッグと判定されるのは少し動いた後なので、
+        // その時のポインタではなく押した位置で、移動か端の伸縮かを決める
+        let press = ui.input(|i| i.pointer.press_origin());
+        let mut pressed_clip: Option<(Id, DragKind)> = None;
         for (ti, track) in p.tracks.iter().enumerate() {
             let row = Rect::from_min_size(Pos2::new(rect.left(), ruler.bottom() + ti as f32 * ROW_H), Vec2::new(rect.width(), ROW_H));
             if ti % 2 == 1 {
@@ -162,12 +190,15 @@ impl Timeline {
                                 }
                             }
                             DragKind::TrimStart => {
-                                let s = self.snap(p, rect, d.start + delta, playhead, c.id).max(d.start - scale_time(d.source_in, 1.0 / d.speed)).min(d.start + d.duration - Time(1));
+                                let s = self.snap(p, rect, d.start + delta, playhead, c.id).max(d.start_min()).min(d.start + d.duration - Time(1));
                                 start = s;
                                 dur = d.duration - (s - d.start);
                             }
                             DragKind::TrimEnd => {
-                                let e = self.snap(p, rect, d.start + d.duration + delta, playhead, c.id).max(d.start + Time(1));
+                                let mut e = self.snap(p, rect, d.start + d.duration + delta, playhead, c.id).max(d.start + Time(1));
+                                if let Some(m) = d.end_max() {
+                                    e = e.min(m);
+                                }
                                 dur = e - d.start;
                             }
                         }
@@ -230,12 +261,20 @@ impl Timeline {
                     painter.with_clip_rect(r).text(r.right_top() + Vec2::new(-4.0, 2.0), Align2::RIGHT_TOP, "◐", FontId::proportional(11.0), Color32::from_white_alpha(200));
                 }
                 let name = p.assets.get(&c.asset).map(|a| a.name.as_str()).unwrap_or("?");
-                let name = if c.speed == 1.0 { name.to_string() } else { format!("×{} {name}", fmt_speed(c.speed)) };
+                let mut name = if c.speed == 1.0 { name.to_string() } else { format!("×{} {name}", fmt_speed(c.speed)) };
+                if c.reverse {
+                    name = format!("◀ {name}");
+                }
                 painter.with_clip_rect(r).text(r.left_center() + Vec2::new(5.0, 0.0), Align2::LEFT_CENTER, name, FontId::proportional(12.0), Color32::WHITE);
+                let kind_at = |pp: Pos2| if pp.x - r.left() < EDGE { DragKind::TrimStart } else if r.right() - pp.x < EDGE { DragKind::TrimEnd } else { DragKind::Move };
                 if let Some(pp) = pointer {
                     if r.contains(pp) && self.drag.is_none() {
-                        let kind = if pp.x - r.left() < EDGE { DragKind::TrimStart } else if r.right() - pp.x < EDGE { DragKind::TrimEnd } else { DragKind::Move };
-                        hovered_clip = Some((c.id, kind));
+                        hovered_clip = Some((c.id, kind_at(pp)));
+                    }
+                }
+                if let Some(pp) = press {
+                    if r.contains(pp) {
+                        pressed_clip = Some((c.id, kind_at(pp)));
                     }
                 }
             }
@@ -254,9 +293,9 @@ impl Timeline {
 
         // 操作
         if resp.drag_started() {
-            if let (Some(pp), Some((id, kind))) = (resp.interact_pointer_pos(), hovered_clip) {
+            if let (Some(pp), Some((id, kind))) = (press.or(resp.interact_pointer_pos()), pressed_clip.or(hovered_clip)) {
                 let (ti, c) = p.tracks.iter().enumerate().find_map(|(i, t)| t.clips.iter().find(|c| c.id == id).map(|c| (i, c))).unwrap();
-                self.drag = Some(Drag { clip: id, kind, grab: self.t_of(rect, pp.x), start: c.start, duration: c.duration, source_in: c.source_in, speed: c.speed, track: ti });
+                self.drag = Some(Drag { clip: id, kind, grab: self.t_of(rect, pp.x), start: c.start, duration: c.duration, source_in: c.source_in, speed: c.speed, reverse: c.reverse, tail: p.assets.get(&c.asset).and_then(|a| a.kind.duration()).map(|d| (d - c.source_in - c.source_len()).max(Time::ZERO)), track: ti });
                 actions.push(Action::Select(Some(id)));
             }
         }
@@ -277,14 +316,18 @@ impl Timeline {
                         (start != d.start || to.is_some()).then_some(Command::MoveClip { clip: d.clip, start, track: to })
                     }
                     DragKind::TrimStart => {
-                        let s = self.snap(p, rect, d.start + delta, playhead, d.clip).max(d.start - scale_time(d.source_in, 1.0 / d.speed)).min(d.start + d.duration - Time(1));
+                        let s = self.snap(p, rect, d.start + delta, playhead, d.clip).max(d.start_min()).min(d.start + d.duration - Time(1));
                         let shift = s - d.start;
-                        let src = (d.source_in + scale_time(shift, d.speed)).max(Time::ZERO);
+                        let src = d.source_after_trim_start(shift);
                         (shift != Time::ZERO).then_some(Command::TrimClip { clip: d.clip, start: Some(s), duration: Some(d.duration - shift), source_in: Some(src) })
                     }
                     DragKind::TrimEnd => {
-                        let e = self.snap(p, rect, d.start + d.duration + delta, playhead, d.clip).max(d.start + Time(1));
-                        (e - d.start != d.duration).then_some(Command::TrimClip { clip: d.clip, start: None, duration: Some(e - d.start), source_in: None })
+                        let mut e = self.snap(p, rect, d.start + d.duration + delta, playhead, d.clip).max(d.start + Time(1));
+                        if let Some(m) = d.end_max() {
+                            e = e.min(m);
+                        }
+                        let src = d.source_after_trim_end(e - d.start - d.duration);
+                        (e - d.start != d.duration).then_some(Command::TrimClip { clip: d.clip, start: None, duration: Some(e - d.start), source_in: src })
                     }
                 };
                 if let Some(c) = cmd {
