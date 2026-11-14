@@ -680,3 +680,55 @@ fn color_blur_and_chroma_key_render() {
     let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
     assert!(near(px(&img, 0, 0), (255, 0, 0)) || near(px(&img, -1, 0), (0, 255, 0)));
 }
+
+#[test]
+fn speed_changes_video_frame_and_audio_pitch() {
+    let d = dir();
+    let video = d.join("speed_src.mp4");
+    make_source(&video);
+    let wav = d.join("tone440.wav");
+    write_wav(&wav, 4.0, |t| (t * 440.0 * std::f64::consts::TAU).sin() as f32 * 0.5);
+    let mut ed = Editor::new(Project::default());
+    ed.execute(SetSettings { width: Some(W), height: Some(H), frame_rate: Some(Rate::new(FPS, 1)), sample_rate: None }, Origin::User).unwrap();
+    let o = ed
+        .transaction(
+            "準備",
+            vec![
+                AddTrack { kind: TrackKind::Video, name: None, index: None, id: None },
+                AddTrack { kind: TrackKind::Audio, name: None, index: None, id: None },
+                ImportAsset { name: "v".into(), path: video.to_string_lossy().into(), kind: studio_media::probe(&video).unwrap(), id: None },
+                ImportAsset { name: "a".into(), path: wav.to_string_lossy().into(), kind: studio_media::probe(&wav).unwrap(), id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [tv, ta, av, aa] = o.created[..] else { panic!() };
+    let o = ed
+        .transaction(
+            "配置",
+            vec![
+                AddClip { track: tv, asset: av, start: s(0.0), duration: None, source_in: None, id: None },
+                AddClip { track: ta, asset: aa, start: s(0.0), duration: None, source_in: None, id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [cv, ca] = o.created[..] else { panic!() };
+    ed.execute(SetSpeed { clip: cv, speed: 2.0 }, Origin::User).unwrap();
+    ed.execute(SetSpeed { clip: ca, speed: 2.0 }, Origin::User).unwrap();
+    // 映像: 0.5 秒目には素材の 1 秒目(フレーム FPS)が出る
+    let mut r = Renderer::new(Gpu::new(None).unwrap());
+    let img = r.render_bgra(&ed.project, s(0.5)).unwrap();
+    assert_eq!(read_index(&img, W), FPS);
+    let img = r.render_bgra(&ed.project, s(1.25)).unwrap();
+    assert_eq!(read_index(&img, W), FPS * 5 / 2);
+    // 音声: 440Hz が 880Hz になる(0.5〜1.5 秒の、上向きのゼロ交差の数)
+    let buf = mix_all(&ed.project);
+    let l: Vec<f32> = buf.chunks(2).map(|c| c[0]).collect();
+    let seg = &l[24_000..72_000];
+    let ups = seg.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+    assert!((875..=885).contains(&ups), "上向きのゼロ交差 {ups}");
+    // 2 倍速で 2 秒の長さになったので、2 秒以降は無音
+    let (pl, _) = peak_in(&buf, 2.1, 2.9);
+    assert!(pl < 1e-3, "{pl}");
+}

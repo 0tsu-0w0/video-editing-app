@@ -281,7 +281,28 @@ impl Mixer {
                 continue;
             }
             let src_start = time_to_sample(span.source_start, self.rate);
-            let Ok(buf) = reader.read(src_start, n) else { continue };
+            let buf = if span.speed == 1.0 {
+                let Ok(b) = reader.read(src_start, n) else { continue };
+                b
+            } else {
+                // 速度が違うときは、必要な長さを読んで直線補間で詰める・伸ばす(音の高さも変わる)
+                let pos0 = span.source_start.secs_f64() * self.rate as f64;
+                let base = pos0.floor() as i64;
+                let need = ((n as f64) * span.speed).ceil() as usize + 2;
+                let Ok(src) = reader.read(base, need) else { continue };
+                let frac0 = pos0 - base as f64;
+                let at = |i: usize, ch: usize| src.get(i * 2 + ch).copied().unwrap_or(0.0);
+                let mut b = vec![0.0f32; n * 2];
+                for k in 0..n {
+                    let x = frac0 + k as f64 * span.speed;
+                    let i = x.floor() as usize;
+                    let f = (x - i as f64) as f32;
+                    for ch in 0..2 {
+                        b[k * 2 + ch] = at(i, ch) * (1.0 - f) + at(i + 1, ch) * f;
+                    }
+                }
+                b
+            };
             let off = (s0 - start) as usize;
             let out = raw.entry(span.track).or_insert_with(|| vec![0.0f32; frames * 2]);
             // 音量とパンは 64 標本ごとに評価し、その間は直線で補間

@@ -130,6 +130,8 @@ struct Studio {
     pick_corners: Option<(Id, PinPick, Vec<(f64, f64)>)>,
     /// クロマキーの色をプレビューから取る対象のクリップ
     pick_key: Option<Id>,
+    /// 速度の欄をドラッグしている間の値
+    speed_edit: Option<(Id, f64)>,
     /// クロマキーのスライダーを動かしている間の値(確定前のプレビュー用)
     key_preview: Option<(Id, Option<studio_core::project::ChromaKey>)>,
     /// ミキサーの窓を出すか
@@ -205,6 +207,7 @@ impl Studio {
             person_part: "head",
             pick_corners: None,
             pick_key: None,
+            speed_edit: None,
             key_preview: None,
             use_proxies: true,
             proxy_queue: VecDeque::new(),
@@ -736,7 +739,7 @@ impl Studio {
                 let sc = p.clip(source).unwrap();
                 let path = PathBuf::from(&p.assets[&sc.asset].path);
                 let mut reader = studio_media::VideoReader::open(&path).map_err(|e| e.to_string())?;
-                let f = reader.frame_at(sc.source_in + (from - sc.start)).map_err(|e| e.to_string())?;
+                let f = reader.frame_at(sc.source_at(from - sc.start)).map_err(|e| e.to_string())?;
                 // 平らな場所をクリックしても、近くの追跡しやすい点に吸着させる
                 let start = studio_track::best_point_near(&f.bgra, f.width, f.height, src_px, 24.0);
                 let tr = studio_track::track_point(&p, source, from, tc.end(), start, |d, t| {
@@ -1332,6 +1335,35 @@ impl Studio {
                 self.run_merged("フェード", vec![SetFade { clip: id, fade_in: Some(fi), fade_out: Some(fo) }], &format!("fade:{id}"), 2);
             }
         });
+        // 再生速度(動画・音声のみ)
+        let timed = self.editor.project.assets.get(&clip.asset).is_some_and(|a| a.kind.duration().is_some());
+        if timed {
+            ui.horizontal(|ui| {
+                ui.label("速度");
+                let mut sp = match self.speed_edit {
+                    Some((c, v)) if c == id => v,
+                    _ => clip.speed,
+                };
+                let r = ui.add(egui::DragValue::new(&mut sp).range(studio_core::project::SPEED_RANGE).speed(0.01).suffix(" 倍").max_decimals(2));
+                if r.changed() {
+                    self.speed_edit = Some((id, sp));
+                }
+                let mut pick = None;
+                if r.drag_stopped() || (r.changed() && !r.dragged()) || r.lost_focus() {
+                    pick = self.speed_edit.take().map(|(_, v)| v);
+                }
+                for v in [0.5, 1.0, 2.0] {
+                    if ui.add(egui::Button::selectable(clip.speed == v, format!("{}倍", timeline::fmt_speed(v)))).clicked() {
+                        pick = Some(v);
+                    }
+                }
+                if let Some(v) = pick.filter(|v| *v != clip.speed) {
+                    self.run("速度", vec![Command::SetSpeed { clip: id, speed: v }]);
+                }
+            })
+            .response
+            .on_hover_text("同じ素材の範囲を、速度に合わせた長さで再生します(2 倍なら長さが半分)。音声は高さも変わります");
+        }
         let on_video_track = self.editor.project.find_clip(id).is_some_and(|(ti, _)| self.editor.project.tracks[ti].kind == TrackKind::Video);
         if on_video_track {
             // トランジション(始まり・終わり)

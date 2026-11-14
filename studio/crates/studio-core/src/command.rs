@@ -181,6 +181,8 @@ pub enum Command {
         mask: Option<Mask>,
     },
     /// トランジションを付ける・外す(edge: "in" は始まり、"out" は終わり。transition が無ければ外す)
+    /// 再生速度を変える。同じ素材の範囲を使うよう、長さ・キーフレーム・フェードなどの時刻も合わせて伸び縮みする
+    SetSpeed { clip: Id, speed: f64 },
     /// クロマキーを付ける・外す(key が無ければ外す)
     SetChromaKey {
         clip: Id,
@@ -269,6 +271,7 @@ impl Command {
             Command::SetMask { .. } => "set_mask",
             Command::SetTransition { .. } => "set_transition",
             Command::SetChromaKey { .. } => "set_chroma_key",
+            Command::SetSpeed { .. } => "set_speed",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
             Command::RemoveKey { .. } => "remove_key",
@@ -358,12 +361,16 @@ fn check_clip_time(p: &Project, c: &Clip) -> Result<(), EditError> {
     if c.source_in < Time::ZERO {
         return err("invalid", "素材の使用開始位置が負です");
     }
+    if !SPEED_RANGE.contains(&c.speed) {
+        return err("out_of_range", format!("速度 {} は {}〜{} にしてください", c.speed, SPEED_RANGE.start(), SPEED_RANGE.end()));
+    }
     let a = p.assets.get(&c.asset).ok_or(EditError { code: "not_found", message: format!("素材 {} はありません", c.asset) })?;
     if let Some(d) = a.kind.duration() {
-        if c.source_in + c.duration > d {
+        if c.source_in + c.source_len() > d + Time(1) {
+            let sp = if c.speed == 1.0 { String::new() } else { format!("(速度 {} 倍なので素材は {} 使う)", c.speed, c.source_len()) };
             return err(
                 "out_of_range",
-                format!("素材「{}」の長さは {} です。使用開始 {} + 長さ {} が超えています", a.name, d, c.source_in, c.duration),
+                format!("素材「{}」の長さは {} です。使用開始 {} + 長さ {}{sp} が超えています", a.name, d, c.source_in, c.duration),
             );
         }
     }
@@ -501,7 +508,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 (None, None) => Time::from_secs_f64(5.0),
             };
             let id = take_id(p, id)?;
-            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
+            let clip = Clip { id, asset, start, duration, source_in, speed: 1.0, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
             check_clip_time(p, &clip)?;
             insert_clip(track_mut(p, track)?, clip)?;
             done(
@@ -604,7 +611,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             let left = at - c.start;
             t.clips[ci].duration = left;
             // 右側のキーフレームは、新しいクリップの開始基準に付け直す
-            let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: c.source_in + left, fade_in: Time::ZERO, ..c.clone() };
+            let mut right = Clip { id: new_id, start: at, duration: c.duration - left, source_in: c.source_at(left), fade_in: Time::ZERO, ..c.clone() };
             right.fade_out = right.fade_out.min(right.duration);
             right.transition_in = None;
             if right.transition_out.is_some_and(|t| t.duration > right.duration) {
@@ -729,6 +736,55 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 None => format!("クリップ {clip} の{side}のトランジションを外す"),
             };
             done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)
+        }
+        SetSpeed { clip, speed } => {
+            if !speed.is_finite() || !SPEED_RANGE.contains(&speed) {
+                return err("out_of_range", format!("速度 {speed} は {}〜{} にしてください", SPEED_RANGE.start(), SPEED_RANGE.end()));
+            }
+            let (t, ci) = clip_mut(p, clip)?;
+            unlocked(t)?;
+            let tid = t.id;
+            let old = t.clips.remove(ci);
+            let mut c = old.clone();
+            // 時刻を k 倍する(同じ素材の範囲を、速度に合わせた長さで使う)
+            let k = old.speed / speed;
+            let st = |x: Time| scale_time(x, k);
+            c.speed = speed;
+            c.duration = st(old.duration).max(Time(1));
+            c.fade_in = st(old.fade_in).min(c.duration);
+            c.fade_out = st(old.fade_out).min(c.duration - c.fade_in);
+            for tr in [&mut c.transition_in, &mut c.transition_out].into_iter().flatten() {
+                tr.duration = st(tr.duration).max(Time(1));
+            }
+            let ti = c.transition_in.map_or(Time::ZERO, |t| t.duration);
+            if c.transition_in.is_some_and(|t| t.duration > c.duration) {
+                c.transition_in = None;
+            }
+            if c.transition_out.is_some_and(|t| ti + t.duration > c.duration) {
+                c.transition_out = None;
+            }
+            for (name, _, _) in PARAMS {
+                for key in &mut c.params.get_mut(name).unwrap().keys {
+                    key.time = st(key.time);
+                }
+            }
+            for pk in &mut c.pin {
+                pk.time = st(pk.time);
+            }
+            let r = check_clip_time(p, &c).and_then(|_| insert_clip(track_mut(p, tid)?, c.clone()));
+            if let Err(mut e) = r {
+                insert_clip(track_mut(p, tid)?, old).expect("元に戻せない");
+                if e.code == "overlap" || e.message.contains("重な") {
+                    e.message = format!("{}(速度 {speed} 倍で長さが {} になるため。後ろのクリップを動かすか、先に短くしてください)", e.message, c.duration);
+                }
+                return Err(e);
+            }
+            done(
+                vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }],
+                cmd.clone(),
+                None,
+                format!("クリップ {clip} の速度を {speed} 倍に(長さ {})", c.duration),
+            )
         }
         SetChromaKey { clip, key } => {
             let (t, ci) = clip_mut(p, clip)?;

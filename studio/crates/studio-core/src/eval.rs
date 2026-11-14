@@ -69,7 +69,7 @@ fn clip_layer(p: &Project, c: &Clip, t: Time, held: bool) -> Option<Layer> {
     let local = if held { raw.min(c.duration - Time(1)) } else { raw };
     let pr = &c.params;
     let mut opacity = pr.opacity.eval(local).clamp(0.0, 1.0) * if held { 1.0 } else { c.fade_gain(local) };
-    let mut source_time = c.source_in + raw;
+    let mut source_time = c.source_at(raw);
     if held {
         if let Some(d) = p.assets.get(&c.asset).and_then(|a| a.kind.duration()) {
             // 素材の終わりを越えたら、最後のフレームで止める
@@ -181,6 +181,8 @@ pub struct AudioSpan {
     pub source_start: Time,
     /// クリップの開始時刻(音量などのキーフレームの基準)
     pub clip_start: Time,
+    /// 再生速度(素材を何倍の速さで読むか)
+    pub speed: f64,
 }
 
 pub fn audio_spans(p: &Project, from: Time, to: Time) -> Vec<AudioSpan> {
@@ -197,7 +199,7 @@ pub fn track_audio_spans(p: &Project, from: Time, to: Time, with_muted: bool) ->
             }
             let s = c.start.max(from);
             let e = c.end().min(to);
-            out.push(AudioSpan { track: track.id, clip: c.id, asset: c.asset, start: s, end: e, source_start: c.source_in + (s - c.start), clip_start: c.start });
+            out.push(AudioSpan { track: track.id, clip: c.id, asset: c.asset, start: s, end: e, source_start: c.source_at(s - c.start), clip_start: c.start, speed: c.speed });
         }
     }
     out

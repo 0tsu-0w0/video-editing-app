@@ -3,6 +3,7 @@
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 use studio_core::{Command, Id, Project, Time, TrackKind};
+use studio_core::project::scale_time;
 
 pub const HEADER_W: f32 = 120.0;
 const RULER_H: f32 = 22.0;
@@ -25,6 +26,7 @@ struct Drag {
     start: Time,
     duration: Time,
     source_in: Time,
+    speed: f64,
     track: usize,
 }
 
@@ -160,7 +162,7 @@ impl Timeline {
                                 }
                             }
                             DragKind::TrimStart => {
-                                let s = self.snap(p, rect, d.start + delta, playhead, c.id).max(d.start - d.source_in).min(d.start + d.duration - Time(1));
+                                let s = self.snap(p, rect, d.start + delta, playhead, c.id).max(d.start - scale_time(d.source_in, 1.0 / d.speed)).min(d.start + d.duration - Time(1));
                                 start = s;
                                 dur = d.duration - (s - d.start);
                             }
@@ -190,11 +192,11 @@ impl Timeline {
                         let col = Color32::from_rgba_unmultiplied(220, 255, 230, 150);
                         let mut x = r.left().max(rect.left() + HEADER_W);
                         while x < r.right().min(rect.right()) {
-                            let src = c.source_in + (self.t_of(rect, x) - start);
+                            let src = c.source_at(self.t_of(rect, x) - start);
                             let i = (src.secs_f64() * 100.0) as usize;
                             let span = ((1.0 / self.zoom as f64) * 100.0).ceil().max(1.0) as usize;
                             let v = w.get(i..(i + span).min(w.len())).map(|s| s.iter().cloned().fold(0.0f32, f32::max)).unwrap_or(0.0);
-                            let vol = c.params.volume.eval(src - c.source_in).max(0.0) as f32 * c.fade_gain(self.t_of(rect, x) - start) as f32;
+                            let vol = c.params.volume.eval(self.t_of(rect, x) - start).max(0.0) as f32 * c.fade_gain(self.t_of(rect, x) - start) as f32;
                             let hgt = (v * vol).min(1.0) * half;
                             painter.line_segment([Pos2::new(x, mid - hgt), Pos2::new(x, mid + hgt)], Stroke::new(1.0, col));
                             x += 1.0;
@@ -228,6 +230,7 @@ impl Timeline {
                     painter.with_clip_rect(r).text(r.right_top() + Vec2::new(-4.0, 2.0), Align2::RIGHT_TOP, "◐", FontId::proportional(11.0), Color32::from_white_alpha(200));
                 }
                 let name = p.assets.get(&c.asset).map(|a| a.name.as_str()).unwrap_or("?");
+                let name = if c.speed == 1.0 { name.to_string() } else { format!("×{} {name}", fmt_speed(c.speed)) };
                 painter.with_clip_rect(r).text(r.left_center() + Vec2::new(5.0, 0.0), Align2::LEFT_CENTER, name, FontId::proportional(12.0), Color32::WHITE);
                 if let Some(pp) = pointer {
                     if r.contains(pp) && self.drag.is_none() {
@@ -253,7 +256,7 @@ impl Timeline {
         if resp.drag_started() {
             if let (Some(pp), Some((id, kind))) = (resp.interact_pointer_pos(), hovered_clip) {
                 let (ti, c) = p.tracks.iter().enumerate().find_map(|(i, t)| t.clips.iter().find(|c| c.id == id).map(|c| (i, c))).unwrap();
-                self.drag = Some(Drag { clip: id, kind, grab: self.t_of(rect, pp.x), start: c.start, duration: c.duration, source_in: c.source_in, track: ti });
+                self.drag = Some(Drag { clip: id, kind, grab: self.t_of(rect, pp.x), start: c.start, duration: c.duration, source_in: c.source_in, speed: c.speed, track: ti });
                 actions.push(Action::Select(Some(id)));
             }
         }
@@ -274,9 +277,10 @@ impl Timeline {
                         (start != d.start || to.is_some()).then_some(Command::MoveClip { clip: d.clip, start, track: to })
                     }
                     DragKind::TrimStart => {
-                        let s = self.snap(p, rect, d.start + delta, playhead, d.clip).max(d.start - d.source_in).min(d.start + d.duration - Time(1));
+                        let s = self.snap(p, rect, d.start + delta, playhead, d.clip).max(d.start - scale_time(d.source_in, 1.0 / d.speed)).min(d.start + d.duration - Time(1));
                         let shift = s - d.start;
-                        (shift != Time::ZERO).then_some(Command::TrimClip { clip: d.clip, start: Some(s), duration: Some(d.duration - shift), source_in: Some(d.source_in + shift) })
+                        let src = (d.source_in + scale_time(shift, d.speed)).max(Time::ZERO);
+                        (shift != Time::ZERO).then_some(Command::TrimClip { clip: d.clip, start: Some(s), duration: Some(d.duration - shift), source_in: Some(src) })
                     }
                     DragKind::TrimEnd => {
                         let e = self.snap(p, rect, d.start + d.duration + delta, playhead, d.clip).max(d.start + Time(1));
@@ -304,4 +308,10 @@ impl Timeline {
         }
         actions
     }
+}
+
+/// 速度の表示(1.5 → "1.5"、2 → "2")。
+pub fn fmt_speed(v: f64) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }

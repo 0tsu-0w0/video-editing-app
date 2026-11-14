@@ -531,3 +531,47 @@ fn chroma_key_and_color_params_validate_split_and_undo() {
     ed.undo();
     assert_eq!(ed.project.clip(c).unwrap().key, Some(key));
 }
+
+#[test]
+fn speed_rescales_clip_keys_and_source_and_undoes() {
+    let (mut ed, v1, _v2, _a1, movie, _img) = setup();
+    let c = ed.execute(AddClip { track: v1, asset: movie, start: s(0.0), duration: Some(s(4.0)), source_in: Some(s(1.0)), id: None }, Origin::User).unwrap().created[0];
+    ed.execute(SetKey { clip: c, param: "x".into(), time: s(2.0), value: 100.0, interp: Interp::Linear }, Origin::User).unwrap();
+    ed.execute(SetFade { clip: c, fade_in: Some(s(1.0)), fade_out: None }, Origin::User).unwrap();
+    let before = ed.project.clone();
+
+    // 2 倍速: 長さは半分、キーとフェードも半分の時刻に。素材は同じ範囲(1〜5 秒)を使う
+    ed.execute(SetSpeed { clip: c, speed: 2.0 }, Origin::User).unwrap();
+    let cl = ed.project.clip(c).unwrap().clone();
+    assert_eq!((cl.duration, cl.fade_in, cl.params.x.keys[0].time), (s(2.0), s(0.5), s(1.0)));
+    let l = layers_at(&ed.project, s(1.5)).into_iter().find(|l| l.clip == c).unwrap();
+    assert_eq!(l.source_time, s(4.0));
+    // 0.5 倍速: 長さ 8 秒で、素材は同じ 4 秒分
+    ed.execute(SetSpeed { clip: c, speed: 0.5 }, Origin::User).unwrap();
+    assert_eq!((ed.project.clip(c).unwrap().duration, ed.project.clip(c).unwrap().source_len()), (s(8.0), s(4.0)));
+    // 分割すると、右側の素材の位置も速度どおり
+    let r = ed.execute(SplitClip { clip: c, at: s(2.0), new_id: None }, Origin::User).unwrap().created[0];
+    assert_eq!(ed.project.clip(r).unwrap().source_in, s(2.0));
+    assert_eq!(ed.project.clip(r).unwrap().speed, 0.5);
+    ed.undo();
+    // 範囲外の速度は断る。速くしたまま右端を伸ばして素材を超えるのも断る
+    let e = ed.execute(SetSpeed { clip: c, speed: 20.0 }, Origin::Ai).unwrap_err().to_string();
+    assert!(e.contains("速度"), "{e}");
+    ed.execute(SetSpeed { clip: c, speed: 2.0 }, Origin::User).unwrap();
+    let e = ed.execute(TrimClip { clip: c, start: None, duration: Some(s(5.0)), source_in: None }, Origin::Ai).unwrap_err().to_string();
+    assert!(e.contains("2 倍"), "{e}");
+    ed.undo();
+    assert!(ed.execute(SetSpeed { clip: c, speed: 20.0 }, Origin::Ai).is_err());
+    // 後ろのクリップと重なるなら断る
+    ed.execute(AddClip { track: v1, asset: movie, start: s(9.0), duration: Some(s(1.0)), source_in: None, id: None }, Origin::User).unwrap();
+    let e = ed.execute(SetSpeed { clip: c, speed: 0.4 }, Origin::Ai).unwrap_err().to_string();
+    assert!(e.contains("重な"), "{e}");
+    ed.undo();
+    // 保存・読み込みで変わらない、取り消すと元どおり
+    let back: Project = serde_json::from_str(&serde_json::to_string(&ed.project).unwrap()).unwrap();
+    assert_eq!(back, ed.project);
+    ed.undo();
+    ed.undo();
+    assert_eq!(ed.project.tracks, before.tracks);
+    let _ = ed.project.clip(c).unwrap().source_len();
+}

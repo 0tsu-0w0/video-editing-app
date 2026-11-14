@@ -445,6 +445,9 @@ pub struct Clip {
     /// 素材のどこから使うか
     #[serde(default)]
     pub source_in: Time,
+    /// 再生速度(1 = 等速、2 = 2 倍速、0.5 = スロー)。音声は高さも変わる
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub speed: f64,
     #[serde(default)]
     pub params: ClipParams,
     /// フェードイン・フェードアウトの長さ(映像は不透明度、音声は音量に効く)
@@ -628,11 +631,34 @@ pub fn check_pin(keys: &[PinKey]) -> Result<(), String> {
     Ok(())
 }
 
+fn one() -> f64 {
+    1.0
+}
+fn is_one(v: &f64) -> bool {
+    *v == 1.0
+}
+
+/// 再生速度の範囲。
+pub const SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.1..=10.0;
+
+/// 長さ t を k 倍する(丸め)。
+pub fn scale_time(t: Time, k: f64) -> Time {
+    Time((t.0 as f64 * k).round() as i64)
+}
+
 fn is_zero(t: &Time) -> bool {
     t.0 == 0
 }
 
 impl Clip {
+    /// クリップの開始から local の所で表示する素材の時刻。
+    pub fn source_at(&self, local: Time) -> Time {
+        self.source_in + scale_time(local, self.speed)
+    }
+    /// クリップ全体で使う素材の長さ。
+    pub fn source_len(&self) -> Time {
+        scale_time(self.duration, self.speed)
+    }
     /// クリップ内の時刻 local でのフェードの倍率(0〜1)。
     pub fn fade_gain(&self, local: Time) -> f64 {
         let mut g = 1.0f64;
@@ -752,11 +778,11 @@ impl Project {
                 if c.fade_in < Time::ZERO || c.fade_out < Time::ZERO || c.fade_in + c.fade_out > c.duration {
                     return Err(format!("クリップ {} のフェードが長さを超えています", c.id));
                 }
-                if c.duration <= Time::ZERO || c.start < Time::ZERO || c.source_in < Time::ZERO {
+                if c.duration <= Time::ZERO || c.start < Time::ZERO || c.source_in < Time::ZERO || !SPEED_RANGE.contains(&c.speed) {
                     return Err(format!("クリップ {} の時間が不正です", c.id));
                 }
                 if let Some(d) = a.kind.duration() {
-                    if c.source_in + c.duration > d {
+                    if c.source_in + c.source_len() > d + Time(1) {
                         return Err(format!("クリップ {} が素材の長さを超えています", c.id));
                     }
                 }

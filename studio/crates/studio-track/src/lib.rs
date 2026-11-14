@@ -111,7 +111,7 @@ pub fn track_point(
     let mut pos = Some((point.0 * s, point.1 * s));
     for (i, n) in (n0..=n1).enumerate() {
         let t = fr.frame_to_time(n).max(from);
-        let f = reader.frame_at(clip.source_in + (t - clip.start)).map_err(|e| e.to_string())?;
+        let f = reader.frame_at(clip.source_at(t - clip.start)).map_err(|e| e.to_string())?;
         let g = gray(&f.bgra, f.width, f.height, s);
         let pyr = pyramid(&g);
         if let (Some(p), Some((pg, ppyr))) = (pos, &prev) {
@@ -208,7 +208,7 @@ pub fn track_plane(
     let mut h_cur: vision::Hom = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
     for (i, n) in (n0..=n1).enumerate() {
         let t = fr.frame_to_time(n).max(from);
-        let f = reader.frame_at(clip.source_in + (t - clip.start)).map_err(|e| e.to_string())?;
+        let f = reader.frame_at(clip.source_at(t - clip.start)).map_err(|e| e.to_string())?;
         let g = gray(&f.bgra, f.width, f.height, s);
         let pyr = pyramid(&g);
         let mut lost = false;

@@ -219,7 +219,7 @@ pub fn track_person(
     let mut misses = 0;
     for (i, n) in (n0..=n1).enumerate() {
         let t = fr.frame_to_time(n).max(from);
-        let f = reader.frame_at(clip.source_in + (t - clip.start)).map_err(|e| e.to_string())?;
+        let f = reader.frame_at(clip.source_at(t - clip.start)).map_err(|e| e.to_string())?;
         let frame = Frame { px: &f.bgra, w: f.width, h: f.height };
         let dets = models.detect(&frame)?;
         let chosen = match prev {
