@@ -89,6 +89,11 @@ fn linked_extras(p: &Project, c: &Command) -> Vec<Command> {
             _ => vec![],
         },
         RemoveClip { clip } => partner(*clip).map(|b| vec![RemoveClip { clip: b.id }]).unwrap_or_default(),
+        // 複製は相手も同じだけずらして複製する(トラックは相手のまま)
+        DuplicateClip { clip, start, .. } => match (p.clip(*clip), partner(*clip)) {
+            (Some(a), Some(b)) => vec![DuplicateClip { clip: b.id, start: (b.start + (*start - a.start)).max(Time::ZERO), track: None, new_id: None }],
+            _ => vec![],
+        },
         SetSpeed { clip, speed } => match (p.clip(*clip), partner(*clip)) {
             (Some(a), Some(b)) if aligned(a, b) => vec![SetSpeed { clip: b.id, speed: *speed }],
             _ => vec![],
@@ -110,7 +115,8 @@ fn run_with(project: &mut Project, cmds: &[Command], link: bool) -> Result<(Vec<
     let next_id = project.next_id;
     for (i, c0) in cmds.iter().enumerate() {
         let extras = if link { linked_extras(project, c0) } else { vec![] };
-        let split_pair = matches!(c0, Command::SplitClip { .. }) && !extras.is_empty();
+        // 分割・複製で相手の分もできたら、新しいクリップどうしをリンクする
+        let split_pair = matches!(c0, Command::SplitClip { .. } | Command::DuplicateClip { .. }) && !extras.is_empty();
         let mut created_here = vec![];
         let mut seq: Vec<Command> = std::iter::once(c0.clone()).chain(extras).collect();
         let mut k = 0;
@@ -128,7 +134,7 @@ fn run_with(project: &mut Project, cmds: &[Command], link: bool) -> Result<(Vec<
                     } else if let Some(s) = out.summary.last_mut() {
                         s.push_str(&format!("(リンク: {})", a.summary));
                     }
-                    // 分割したときは、右側どうしもリンクする
+                    // 分割・複製したときは、新しいクリップどうしもリンクする
                     if split_pair && k == seq.len() && seq.len() == 2 && created_here.len() == 2 {
                         seq.push(Command::SetLink { clip: created_here[0], other: Some(created_here[1]) });
                     }

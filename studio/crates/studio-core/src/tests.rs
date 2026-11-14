@@ -668,3 +668,43 @@ fn linked_clips_move_trim_split_and_delete_together() {
     let back: Project = serde_json::from_str(&serde_json::to_string(&ed.project).unwrap()).unwrap();
     assert_eq!(back, ed.project);
 }
+
+#[test]
+fn duplicate_copies_everything_and_follows_link() {
+    let (mut ed, v1, v2, a1, movie, _img) = setup();
+    let o = ed
+        .transaction(
+            "置く",
+            vec![
+                AddClip { track: v1, asset: movie, start: s(0.0), duration: Some(s(2.0)), source_in: Some(s(1.0)), id: None },
+                AddClip { track: a1, asset: movie, start: s(0.0), duration: Some(s(2.0)), source_in: Some(s(1.0)), id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [v, a] = o.created[..] else { panic!() };
+    ed.execute(SetLink { clip: v, other: Some(a) }, Origin::User).unwrap();
+    ed.execute(SetKey { clip: v, param: "x".into(), time: s(1.0), value: 50.0, interp: Interp::Linear }, Origin::User).unwrap();
+    ed.execute(SetChromaKey { clip: v, key: Some(ChromaKey { color: "#00FF00".into(), tolerance: 0.2, softness: 0.1, spill: 0.5 }) }, Origin::User).unwrap();
+    let d = ed.execute(DuplicateClip { clip: v, start: s(3.0), track: None, new_id: None }, Origin::User).unwrap().created[0];
+    let (orig, dup) = (ed.project.clip(v).unwrap().clone(), ed.project.clip(d).unwrap().clone());
+    assert_eq!((dup.start, dup.source_in, &dup.params, &dup.key), (s(3.0), orig.source_in, &orig.params, &orig.key));
+    // 音声も複製され、新しいものどうしがリンクされる(元のリンクはそのまま)
+    let da = dup.link.unwrap();
+    assert_eq!(ed.project.clip(da).unwrap().start, s(3.0));
+    assert_eq!(ed.project.clip(da).unwrap().link, Some(d));
+    assert_eq!(ed.project.clip(v).unwrap().link, Some(a));
+    // 別の映像トラックへ。音声トラックへは断る。重なるのも断る
+    // (相手の音声も同じだけずれるので、音声が重なる 0 秒には置けない)
+    assert!(ed.execute(DuplicateClip { clip: d, start: s(0.0), track: Some(v2), new_id: None }, Origin::User).is_err());
+    ed.execute(DuplicateClip { clip: d, start: s(6.0), track: Some(v2), new_id: None }, Origin::User).unwrap();
+    assert!(ed.execute(DuplicateClip { clip: v, start: s(6.0), track: Some(a1), new_id: None }, Origin::User).is_err());
+    assert!(ed.execute(DuplicateClip { clip: v, start: s(1.0), track: None, new_id: None }, Origin::User).is_err());
+    // 取り消し・やり直し
+    let n = ed.project.tracks.iter().map(|t| t.clips.len()).sum::<usize>();
+    ed.undo();
+    ed.undo();
+    assert_eq!(ed.project.tracks.iter().map(|t| t.clips.len()).sum::<usize>(), n - 4);
+    ed.redo();
+    assert_eq!(ed.project.clip(d).unwrap().link, Some(da));
+}

@@ -185,6 +185,16 @@ pub enum Command {
     SetSpeed { clip: Id, speed: f64 },
     /// 素材のコマが足りないとき、前後のコマを混ぜてなめらかにする(フレームブレンド)
     SetFrameBlend { on: bool },
+    /// クリップを、値・キーフレーム・エフェクトごと複製して start に置く(track を省略すると同じトラック)
+    DuplicateClip {
+        clip: Id,
+        #[serde(with = "secs")]
+        start: Time,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track: Option<Id>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_id: Option<Id>,
+    },
     /// 2 つのクリップをリンクする(一緒に動く)。other が無ければリンクを外す
     SetLink {
         clip: Id,
@@ -290,6 +300,7 @@ impl Command {
             "set_reverse" => "逆再生",
             "set_link" => "リンク",
             "set_frame_blend" => "コマの補間",
+            "duplicate_clip" => "クリップの複製",
             "set_keep_pitch" => "音の高さ",
             n => n,
         }
@@ -322,6 +333,7 @@ impl Command {
             Command::SetReverse { .. } => "set_reverse",
             Command::SetLink { .. } => "set_link",
             Command::SetFrameBlend { .. } => "set_frame_blend",
+            Command::DuplicateClip { .. } => "duplicate_clip",
             Command::SetKeepPitch { .. } => "set_keep_pitch",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
@@ -567,6 +579,29 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 AddClip { track, asset, start, duration: Some(duration), source_in: Some(source_in), id: Some(id) },
                 Some(id),
                 format!("クリップ {id}(素材「{}」)をトラック {track} の {start}〜{} に追加", a.name, start + duration),
+            )
+        }
+        DuplicateClip { clip, start, track, new_id } => {
+            let (ti, ci) = p.find_clip(clip).ok_or(EditError { code: "not_found", message: format!("クリップ {clip} はありません") })?;
+            let src_kind = p.tracks[ti].kind;
+            let mut c = p.tracks[ti].clips[ci].clone();
+            let tid = track.unwrap_or(p.tracks[ti].id);
+            let t = p.track(tid).ok_or(EditError { code: "not_found", message: format!("トラック {tid} はありません") })?;
+            if t.kind != src_kind {
+                return err("invalid", format!("トラック {tid} は{}のトラックです(複製元と同じ種類のトラックにしてください)", if t.kind == TrackKind::Video { "映像" } else { "音声" }));
+            }
+            unlocked(t)?;
+            let nid = take_id(p, new_id)?;
+            c.id = nid;
+            c.start = start;
+            c.link = None;
+            check_clip_time(p, &c)?;
+            insert_clip(track_mut(p, tid)?, c.clone())?;
+            done(
+                vec![RemoveClip { clip: nid }],
+                DuplicateClip { clip, start, track: Some(tid), new_id: Some(nid) },
+                Some(nid),
+                format!("クリップ {clip} を複製して {}〜{} に置く(新しいクリップ {nid})", c.start, c.end()),
             )
         }
         RemoveClip { clip } => {

@@ -51,6 +51,8 @@ pub fn command_schema() -> Value {
                 "clip": "クリップ ID", "speed": "数値"}},
             {"command": "set_reverse", "description": "逆再生にする(reverse: true)・戻す(false)。素材の同じ範囲を終わりから始まりへ再生する(音声も逆になる)。set_speed と組み合わせられる", "args": {
                 "clip": "クリップ ID", "reverse": "true / false"}},
+            {"command": "duplicate_clip", "description": "クリップを、値・キーフレーム・エフェクト・マスクなどごと複製して start(秒)に置く。track を省略すると同じトラック。リンクしたクリップなら相手も同じだけずらして複製し、新しいものどうしをリンクする", "args": {
+                "clip": "クリップ ID", "start": "秒", "track": "(任意)同じ種類のトラック ID"}},
             {"command": "set_frame_blend", "description": "フレームブレンド: 素材のコマが足りないとき(プロジェクトより低いフレームレートの動画やスロー再生)、前後のコマを混ぜてなめらかにする(プロジェクト全体の設定)", "args": {
                 "on": "true / false"}},
             {"command": "set_link", "description": "2 つのクリップをリンクする(動画の映像と音声など)。リンクしたクリップは、片方への move_clip・remove_clip・split_clip と、時間がそろっているときの trim_clip・set_speed・set_reverse が、もう一方にも自動で効く(相手の分のコマンドは送らない)。other を省略するとリンクを外す", "args": {
@@ -337,7 +339,7 @@ mod tests {
             serde_json::from_value::<Command>(ex.clone()).unwrap();
         }
         let names: Vec<&str> = s["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask", "set_chroma_key", "set_speed", "set_reverse", "set_keep_pitch", "set_link", "set_frame_blend"] {
+        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask", "set_chroma_key", "set_speed", "set_reverse", "set_keep_pitch", "set_link", "set_frame_blend", "duplicate_clip"] {
             assert!(names.contains(&n), "{n} の説明がない");
         }
         assert!(!names.iter().any(|n| n.starts_with("restore")), "内部用コマンドを公開しない");

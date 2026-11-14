@@ -136,6 +136,8 @@ struct Studio {
     key_preview: Option<(Id, Option<studio_core::project::ChromaKey>)>,
     /// ミキサーの窓を出すか
     show_mixer: bool,
+    /// Ctrl+C で覚えたクリップ
+    clip_clipboard: Option<Id>,
     /// 書き出しの設定の窓(範囲 [秒] と画質)
     export_dialog: Option<(Option<(f64, f64)>, studio_render::Quality)>,
     /// プレビューでプロキシを使うか
@@ -216,6 +218,7 @@ impl Studio {
             proxy_job: None,
             proxy_checked: Default::default(),
             show_mixer: std::env::var("STUDIO_SHOW_MIXER").is_ok_and(|v| v == "1"),
+            clip_clipboard: None,
             export_dialog: std::env::var("STUDIO_SHOW_EXPORT").is_ok_and(|v| v == "1").then_some((None, studio_render::Quality::Standard)),
             meters: Default::default(),
             last_track_result: String::new(),
@@ -1081,6 +1084,27 @@ impl Studio {
         }
     }
 
+    /// クリップを複製して start に置く。同じトラックで重なるときは、同じ種類の別のトラックを順に試す。
+    fn duplicate_clip(&mut self, id: Id, start: Time) {
+        let p = &self.editor.project;
+        let Some((ti, _)) = p.find_clip(id) else { return };
+        let kind = p.tracks[ti].kind;
+        let mut tracks = vec![p.tracks[ti].id];
+        tracks.extend(p.tracks.iter().filter(|t| t.kind == kind && t.id != p.tracks[ti].id && !t.locked).map(|t| t.id));
+        let mut last_err = String::new();
+        for t in tracks {
+            match self.editor.transaction("クリップの複製", vec![Command::DuplicateClip { clip: id, start, track: Some(t), new_id: None }], Origin::User) {
+                Ok(o) => {
+                    self.selected = o.created.first().copied();
+                    self.status = o.summary.join(" / ");
+                    return;
+                }
+                Err(e) => last_err = e.error.message,
+            }
+        }
+        self.status = format!("貼り付けられません: {last_err}");
+    }
+
     fn import_subtitles(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("字幕", &["srt", "vtt"]).pick_file() else { return };
         let src = match std::fs::read(&path) {
@@ -1146,6 +1170,24 @@ impl Studio {
         }
         if pressed(Key::S, Modifiers::COMMAND) {
             self.save(false);
+        }
+        // クリップのコピー・貼り付け・複製(値・キーフレーム・エフェクトごと。リンクした音声も一緒)
+        if pressed(Key::C, Modifiers::COMMAND) {
+            if let Some(id) = self.selected.filter(|id| self.editor.project.clip(*id).is_some()) {
+                self.clip_clipboard = Some(id);
+                self.status = format!("クリップ {id} をコピーしました(Ctrl+V で再生位置に貼り付け)");
+            }
+        }
+        if pressed(Key::V, Modifiers::COMMAND) {
+            match self.clip_clipboard.filter(|id| self.editor.project.clip(*id).is_some()) {
+                Some(id) => self.duplicate_clip(id, self.playhead),
+                None => self.status = "コピーしたクリップがありません(クリップを選んで Ctrl+C)".into(),
+            }
+        }
+        if pressed(Key::D, Modifiers::COMMAND) {
+            if let Some(c) = self.selected.and_then(|id| self.editor.project.clip(id)).cloned() {
+                self.duplicate_clip(c.id, c.end());
+            }
         }
         if pressed(Key::ArrowRight, Modifiers::NONE) {
             let t = fr.frame_to_time(fr.time_to_frame(self.playhead) + 1);
@@ -1458,7 +1500,7 @@ impl Studio {
             ui.weak("クリップを選ぶと、ここで位置・大きさ・不透明度・音量などを調整できます。");
             ui.add_space(8.0);
             ui.heading("操作");
-            ui.weak("Space: 再生/停止\n← →: 1 フレーム移動\nS: 分割\nDelete: 削除\nCtrl+Z / Ctrl+Y: 元に戻す / やり直し\nCtrl+ホイール: タイムラインの拡大縮小");
+            ui.weak("Space: 再生/停止\n← →: 1 フレーム移動\nS: 分割\nDelete: 削除\nCtrl+C / Ctrl+V: クリップのコピー・貼り付け\nCtrl+D: すぐ後ろに複製\nCtrl+Z / Ctrl+Y: 元に戻す / やり直し\nCtrl+ホイール: タイムラインの拡大縮小");
             return;
         };
         let clip = self.editor.project.clip(id).unwrap().clone();
@@ -1747,6 +1789,11 @@ impl Studio {
         }
         let linked = self.editor.project.clip(id).and_then(|c| c.link).filter(|o| self.editor.project.clip(*o).is_some());
         ui.horizontal(|ui| {
+            if ui.button("複製").on_hover_text("このクリップのすぐ後ろに、値・キーフレーム・エフェクトごと複製します(Ctrl+D)。Ctrl+C / Ctrl+V で再生位置に貼り付けもできます").clicked() {
+                if let Some(c) = self.editor.project.clip(id).cloned() {
+                    self.duplicate_clip(id, c.end());
+                }
+            }
             if ui.button("このクリップを削除").on_hover_text(if linked.is_some() { "リンクしている音声(映像)も一緒に消えます" } else { "" }).clicked() {
                 self.selected = None;
                 self.run("削除", vec![RemoveClip { clip: id }]);
