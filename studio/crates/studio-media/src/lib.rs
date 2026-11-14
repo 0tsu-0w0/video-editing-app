@@ -162,6 +162,8 @@ pub struct VideoReader {
     pub duration: Time,
     /// シークしてから目的のフレームまでに読んだフレーム(逆再生で、同じ区間を何度も読み直さないため)
     back: std::collections::VecDeque<Frame>,
+    /// 1 つ前に読んだフレーム(前後のコマを混ぜるとき、1 つ先を読んだ後に戻っても読み直さないため)
+    prev: Option<Frame>,
 }
 
 /// 逆再生用に覚えておくフレームの量(バイト)。
@@ -183,7 +185,7 @@ impl VideoReader {
             let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or((w * 4) as i32);
             let rate = cur.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(pack(30, 1));
             let rate = Rate::new(((rate >> 32) as u32).max(1), (rate as u32).max(1));
-            Ok(Self { reader, width: w, height: h, stride, frame_dur: rate.frame_duration(), current: None, cursor: Time::ZERO, eof: false, duration, back: Default::default() })
+            Ok(Self { reader, width: w, height: h, stride, frame_dur: rate.frame_duration(), current: None, cursor: Time::ZERO, eof: false, duration, back: Default::default(), prev: None })
         }
     }
 
@@ -238,6 +240,9 @@ impl VideoReader {
     pub fn frame_at(&mut self, t: Time) -> R<&Frame> {
         init();
         let t = t.max(Time::ZERO);
+        if self.prev.as_ref().is_some_and(|f| t >= f.time && t < f.time + f.duration) {
+            return Ok(self.prev.as_ref().unwrap());
+        }
         if let Some(f) = &self.current {
             if t >= f.time && t < f.time + f.duration {
                 return Ok(self.current.as_ref().unwrap());
@@ -256,6 +261,7 @@ impl VideoReader {
             seek(&self.reader, t)?;
             self.eof = false;
             self.current = None;
+            self.prev = None;
         }
         loop {
             match self.read_next()? {
@@ -270,7 +276,7 @@ impl VideoReader {
                             self.back.push_back(f.clone());
                         }
                     }
-                    self.current = Some(f);
+                    self.prev = self.current.replace(f);
                     if hit {
                         break;
                     }

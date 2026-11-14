@@ -30,6 +30,9 @@ pub struct Layer {
     pub slot: u8,
     /// 色の調整とぼかし
     pub fx: LayerFx,
+    /// 素材を読む速さと向き(フレームブレンドで次のコマを決めるため)
+    pub speed: f64,
+    pub reverse: bool,
     /// クロマキー(色 0〜1、範囲、なめらかさ、色かぶりの抑え)
     pub key: Option<([f64; 3], f64, f64, f64)>,
 }
@@ -137,6 +140,8 @@ fn clip_layer(p: &Project, c: &Clip, t: Time, held: bool) -> Option<Layer> {
         }),
         wipe: if held { None } else { wipe },
         slot: held as u8,
+        speed: c.speed,
+        reverse: c.reverse,
         fx: LayerFx {
             brightness: pr.brightness.eval(local).clamp(-1.0, 1.0),
             contrast: pr.contrast.eval(local).clamp(-1.0, 1.0),

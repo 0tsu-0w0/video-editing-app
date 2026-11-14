@@ -25,6 +25,9 @@ pub struct Settings {
     /// 全体の音量(dB)
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub master_gain_db: f64,
+    /// 素材のコマが足りないとき(低いフレームレートの素材やスロー)、前後のコマを混ぜてなめらかにする
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frame_blend: bool,
 }
 
 fn is_zero_f64(v: &f64) -> bool {
@@ -33,7 +36,7 @@ fn is_zero_f64(v: &f64) -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { width: 1920, height: 1080, frame_rate: Rate::new(30, 1), sample_rate: 48_000, master_gain_db: 0.0 }
+        Self { width: 1920, height: 1080, frame_rate: Rate::new(30, 1), sample_rate: 48_000, master_gain_db: 0.0, frame_blend: false }
     }
 }
 

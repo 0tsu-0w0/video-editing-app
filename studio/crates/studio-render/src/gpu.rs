@@ -27,14 +27,25 @@ cbuffer Mask : register(b2) {
     float4 f_color;  // 明るさ・コントラスト・彩度・色相(ラジアン)
     float4 f_key;    // クロマキーの色、有効
     float4 f_key2;   // 範囲・なめらかさ・色かぶりの抑え・ぼかしの半径(ピクセル)
+    float4 f_blend;  // 次のコマ(tex2)を混ぜる割合
 };
+Texture2D tex2 : register(t1);
+// 1 点を読む(乗算済み)。フレームブレンドでは次のコマと混ぜる
+float4 samp(float2 uv) {
+    float4 c = tex.SampleLevel(smp, uv, 0);
+    c.rgb *= c.a;
+    if (f_blend.x > 0.001) {
+        float4 d = tex2.SampleLevel(smp, uv, 0);
+        d.rgb *= d.a;
+        c = lerp(c, d, f_blend.x);
+    }
+    return c;
+}
 // 素材を読む(乗算済みで返す)。ぼかしは黄金角で並べた 64 点の重み付き平均
 float4 fetch(float2 uv) {
     float r = f_key2.w;
     if (r < 0.25) {
-        float4 c = tex.SampleLevel(smp, uv, 0);
-        c.rgb *= c.a;
-        return c;
+        return samp(uv);
     }
     float4 acc = 0;
     float wsum = 0;
@@ -43,8 +54,7 @@ float4 fetch(float2 uv) {
         float a = k * 2.39996323;
         float2 o = float2(cos(a), sin(a)) * (rr * r) / m_size.xy;
         float w = exp(-2.0 * rr * rr);
-        float4 c = tex.SampleLevel(smp, uv + o, 0);
-        c.rgb *= c.a;
+        float4 c = samp(uv + o);
         acc += c * w;
         wsum += w;
     }
@@ -230,6 +240,8 @@ pub struct MaskCb {
     pub key: [f32; 4],
     /// クロマキーの範囲・なめらかさ・色かぶりの抑え、ぼかしの半径(素材のピクセル)
     pub key2: [f32; 4],
+    /// 次のコマ(`Gpu::set_blend_texture`)を混ぜる割合
+    pub blend: [f32; 4],
 }
 
 /// 単位正方形(u, v ∈ [0,1])を四角形 q(左上・右上・右下・左下)へ写す射影変換。
@@ -411,6 +423,11 @@ impl Gpu {
 
     pub fn clear(&self, rtv: &ID3D11RenderTargetView, rgba: [f32; 4]) {
         unsafe { self.ctx.ClearRenderTargetView(rtv, &rgba) };
+    }
+
+    /// 次に描くレイヤーで混ぜる、次のコマのテクスチャ(無ければ外す)。
+    pub fn set_blend_texture(&self, t: Option<&Texture>) {
+        unsafe { self.ctx.PSSetShaderResources(1, Some(&[t.map(|t| t.srv.clone())])) };
     }
 
     /// 次に描くレイヤーのマスクとワイプを決める(無しにするには `MaskCb::default()`)。

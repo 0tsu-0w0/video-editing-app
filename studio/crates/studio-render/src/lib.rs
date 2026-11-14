@@ -20,7 +20,8 @@ use studio_media::{AudioReader, ExportSettings, Exporter, VideoReader};
 
 /// 素材ごとの GPU テクスチャと、映像の読み取り。
 enum Source {
-    Video { reader: VideoReader, tex: Option<Texture>, shown: Option<Time> },
+    /// tex は表示するコマ、tex2 はフレームブレンドで混ぜる次のコマ
+    Video { reader: VideoReader, tex: Option<Texture>, shown: Option<Time>, tex2: Option<Texture>, shown2: Option<Time> },
     Image { tex: Texture },
     /// 文字。内容が変わったら作り直す
     Text { tex: Texture, made_from: AssetKind },
@@ -60,7 +61,7 @@ impl Renderer {
                     let path = Path::new(&a.path);
                     match &a.kind {
                         AssetKind::Video { .. } => match VideoReader::open(&if self.use_proxies { studio_media::proxy::existing_proxy(path).unwrap_or(path.to_path_buf()) } else { path.to_path_buf() }) {
-                            Ok(reader) => Source::Video { reader, tex: None, shown: None },
+                            Ok(reader) => Source::Video { reader, tex: None, shown: None, tex2: None, shown2: None },
                             Err(e) => Source::Broken(format!("「{}」: {e}", a.name)),
                         },
                         AssetKind::Image { .. } => match studio_media::load_image(path)
@@ -134,21 +135,53 @@ impl Renderer {
             let gpu = &self.gpu as *const Gpu;
             let src = self.source(project, layer.asset, layer.slot);
             let gpu = unsafe { &*gpu };
+            let mut blend = 0.0f32;
+            let mut second: Option<*const Texture> = None;
             let tex: &Texture = match src {
-                Source::Video { reader, tex, shown } => {
-                    let f = match reader.frame_at(layer.source_time) {
-                        Ok(f) => f,
+                Source::Video { reader, tex, shown, tex2, shown2 } => {
+                    let st = layer.source_time;
+                    let (a_time, a_dur) = match reader.frame_at(st) {
+                        Ok(f) => (f.time, f.duration),
                         Err(e) => {
                             eprintln!("フレームを読めません: {e}");
                             continue;
                         }
                     };
-                    if tex.as_ref().map_or(true, |t| (t.width, t.height) != (f.width, f.height)) {
-                        *tex = Some(gpu.create_texture(f.width, f.height, Some(&f.bgra), false)?);
-                    } else if *shown != Some(f.time) {
-                        gpu.update_texture(tex.as_ref().unwrap(), &f.bgra);
+                    // 前の描画で混ぜた次のコマが、今回表示するコマなら入れ替えるだけ
+                    if *shown2 == Some(a_time) && *shown != Some(a_time) {
+                        std::mem::swap(tex, tex2);
+                        std::mem::swap(shown, shown2);
                     }
-                    *shown = Some(f.time);
+                    if *shown != Some(a_time) || tex.is_none() {
+                        let f = reader.frame_at(st).map_err(|e| e.to_string())?;
+                        if tex.as_ref().map_or(true, |t| (t.width, t.height) != (f.width, f.height)) {
+                            *tex = Some(gpu.create_texture(f.width, f.height, Some(&f.bgra), false)?);
+                        } else {
+                            gpu.update_texture(tex.as_ref().unwrap(), &f.bgra);
+                        }
+                        *shown = Some(a_time);
+                    }
+                    // フレームブレンド: 素材の 1 コマがプロジェクトの 1 コマより長く映るとき、次に映るコマを混ぜる
+                    let pd = project.settings.frame_rate.frame_duration().secs_f64();
+                    let shown_for = a_dur.secs_f64() / layer.speed.max(1e-6);
+                    if project.settings.frame_blend && a_dur > Time::ZERO && shown_for > pd * 1.05 {
+                        let into = (st - a_time).secs_f64() / a_dur.secs_f64();
+                        let (frac, next_t) = if layer.reverse { (1.0 - into, a_time - Time(1)) } else { (into, a_time + a_dur) };
+                        if frac > 0.02 && next_t >= Time::ZERO {
+                            if let Ok(fb) = reader.frame_at(next_t) {
+                                if fb.time != a_time && (fb.width, fb.height) == (tex.as_ref().unwrap().width, tex.as_ref().unwrap().height) {
+                                    if tex2.as_ref().map_or(true, |t| (t.width, t.height) != (fb.width, fb.height)) {
+                                        *tex2 = Some(gpu.create_texture(fb.width, fb.height, Some(&fb.bgra), false)?);
+                                    } else if *shown2 != Some(fb.time) {
+                                        gpu.update_texture(tex2.as_ref().unwrap(), &fb.bgra);
+                                    }
+                                    *shown2 = Some(fb.time);
+                                    blend = frac as f32;
+                                    second = tex2.as_ref().map(|t| t as *const Texture);
+                                }
+                            }
+                        }
+                    }
                     tex.as_ref().unwrap()
                 }
                 Source::Image { tex } | Source::Text { tex, .. } => tex,
@@ -169,7 +202,10 @@ impl Renderer {
                 Some(AssetKind::Video { width, height, .. }) => (*width, *height),
                 _ => (tex.width, tex.height),
             };
-            gpu.set_mask(&mask_cb(&layer, tw, th));
+            let mut cb = mask_cb(&layer, tw, th);
+            cb.blend[0] = blend;
+            gpu.set_mask(&cb);
+            gpu.set_blend_texture(second.map(|t| unsafe { &*t }));
             if let Some(c) = &layer.corners {
                 gpu.draw_pinned(&rtv, (w, h), tex, c, layer.opacity);
                 continue;

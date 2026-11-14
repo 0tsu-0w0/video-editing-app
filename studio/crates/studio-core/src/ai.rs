@@ -51,6 +51,8 @@ pub fn command_schema() -> Value {
                 "clip": "クリップ ID", "speed": "数値"}},
             {"command": "set_reverse", "description": "逆再生にする(reverse: true)・戻す(false)。素材の同じ範囲を終わりから始まりへ再生する(音声も逆になる)。set_speed と組み合わせられる", "args": {
                 "clip": "クリップ ID", "reverse": "true / false"}},
+            {"command": "set_frame_blend", "description": "フレームブレンド: 素材のコマが足りないとき(プロジェクトより低いフレームレートの動画やスロー再生)、前後のコマを混ぜてなめらかにする(プロジェクト全体の設定)", "args": {
+                "on": "true / false"}},
             {"command": "set_link", "description": "2 つのクリップをリンクする(動画の映像と音声など)。リンクしたクリップは、片方への move_clip・remove_clip・split_clip と、時間がそろっているときの trim_clip・set_speed・set_reverse が、もう一方にも自動で効く(相手の分のコマンドは送らない)。other を省略するとリンクを外す", "args": {
                 "clip": "クリップ ID", "other": "(任意)相手のクリップ ID"}},
             {"command": "set_keep_pitch", "description": "速度を変えたクリップの音の高さを保つか(既定は true。false ならテープの早回しのように高さも変わる)", "args": {
@@ -226,7 +228,7 @@ pub fn describe(p: &Project) -> Value {
     let s = &p.settings;
     json!({
         "settings": {"width": s.width, "height": s.height, "fps": (s.frame_rate.fps() * 1000.0).round() / 1000.0,
-                     "frame_rate": s.frame_rate, "sample_rate": s.sample_rate, "master_gain_db": s.master_gain_db},
+                     "frame_rate": s.frame_rate, "sample_rate": s.sample_rate, "master_gain_db": s.master_gain_db, "frame_blend": s.frame_blend},
         "duration": r3(p.duration()),
         "assets": assets,
         "tracks": tracks,
@@ -335,7 +337,7 @@ mod tests {
             serde_json::from_value::<Command>(ex.clone()).unwrap();
         }
         let names: Vec<&str> = s["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask", "set_chroma_key", "set_speed", "set_reverse", "set_keep_pitch", "set_link"] {
+        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask", "set_chroma_key", "set_speed", "set_reverse", "set_keep_pitch", "set_link", "set_frame_blend"] {
             assert!(names.contains(&n), "{n} の説明がない");
         }
         assert!(!names.iter().any(|n| n.starts_with("restore")), "内部用コマンドを公開しない");

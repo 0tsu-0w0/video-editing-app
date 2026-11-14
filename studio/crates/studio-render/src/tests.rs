@@ -790,3 +790,51 @@ fn reverse_plays_frames_and_audio_backwards() {
     assert!(peak_in(&buf, 0.1, 2.4).0 < 1e-3);
     assert!(peak_in(&buf, 2.55, 2.95).0 > 0.3);
 }
+
+#[test]
+fn frame_blend_mixes_neighbouring_frames() {
+    let d = dir();
+    let video = d.join("blend_src.mp4");
+    make_source(&video);
+    let mut ed = Editor::new(Project::default());
+    // 60fps のプロジェクトに 30fps の素材
+    ed.execute(SetSettings { width: Some(W), height: Some(H), frame_rate: Some(Rate::new(60, 1)), sample_rate: None }, Origin::User).unwrap();
+    let o = ed
+        .transaction(
+            "準備",
+            vec![
+                AddTrack { kind: TrackKind::Video, name: None, index: None, id: None },
+                ImportAsset { name: "v".into(), path: video.to_string_lossy().into(), kind: studio_media::probe(&video).unwrap(), id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [tv, av] = o.created[..] else { panic!() };
+    let c = ed.execute(AddClip { track: tv, asset: av, start: s(0.0), duration: None, source_in: None, id: None }, Origin::User).unwrap().created[0];
+    let mut r = Renderer::new(Gpu::new(None).unwrap());
+    // ビット 0 のブロック(フレーム番号の偶奇で白黒が変わる)の明るさ
+    let bit0 = |img: &[u8]| img[((BLOCK / 2 * W + BLOCK / 2) * 4 + 1) as usize] as i32;
+    // 10 フレーム目と 11 フレーム目のちょうど間(10.5/30 秒)
+    let mid = Time::from_secs_f64(10.5 / 30.0);
+    let img = r.render_bgra(&ed.project, mid).unwrap();
+    assert!(bit0(&img) < 30, "ブレンドなしは 10 フレーム目のまま {}", bit0(&img));
+    ed.execute(SetFrameBlend { on: true }, Origin::User).unwrap();
+    // 再生と同じく前から順に描いて、テクスチャの入れ替えも確かめる
+    for i in 0..30 {
+        let t = Time::from_secs_f64(i as f64 / 60.0);
+        let img = r.render_bgra(&ed.project, t).unwrap();
+        let v = bit0(&img);
+        if i % 2 == 0 {
+            // コマの始まりは混ぜない(偶数フレームは黒、奇数は白)
+            let want = if (i / 2) % 2 == 0 { 0 } else { 255 };
+            assert!((v - want).abs() < 30, "{i}: {v}");
+        } else {
+            assert!((100..=160).contains(&v), "{i}: 半々に混ざるはず {v}");
+        }
+    }
+    // スロー(0.5 倍)では 30fps のプロジェクトでも混ぜる
+    ed.execute(SetSettings { width: None, height: None, frame_rate: Some(Rate::new(30, 1)), sample_rate: None }, Origin::User).unwrap();
+    ed.execute(SetSpeed { clip: c, speed: 0.5 }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, Time::from_secs_f64(21.0 / 30.0)).unwrap();
+    assert!((100..=160).contains(&bit0(&img)), "スロー {}", bit0(&img));
+}

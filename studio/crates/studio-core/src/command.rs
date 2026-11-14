@@ -183,6 +183,8 @@ pub enum Command {
     /// トランジションを付ける・外す(edge: "in" は始まり、"out" は終わり。transition が無ければ外す)
     /// 再生速度を変える。同じ素材の範囲を使うよう、長さ・キーフレーム・フェードなどの時刻も合わせて伸び縮みする
     SetSpeed { clip: Id, speed: f64 },
+    /// 素材のコマが足りないとき、前後のコマを混ぜてなめらかにする(フレームブレンド)
+    SetFrameBlend { on: bool },
     /// 2 つのクリップをリンクする(一緒に動く)。other が無ければリンクを外す
     SetLink {
         clip: Id,
@@ -287,6 +289,7 @@ impl Command {
             "set_speed" => "速度",
             "set_reverse" => "逆再生",
             "set_link" => "リンク",
+            "set_frame_blend" => "コマの補間",
             "set_keep_pitch" => "音の高さ",
             n => n,
         }
@@ -318,6 +321,7 @@ impl Command {
             Command::SetSpeed { .. } => "set_speed",
             Command::SetReverse { .. } => "set_reverse",
             Command::SetLink { .. } => "set_link",
+            Command::SetFrameBlend { .. } => "set_frame_blend",
             Command::SetKeepPitch { .. } => "set_keep_pitch",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
@@ -1040,6 +1044,10 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
             let old = std::mem::replace(&mut t.audio.effects, effects);
             let n = t.audio.effects.len();
             done(vec![SetTrackEffects { track, effects: old }], cmd.clone(), None, format!("トラック {track} のエフェクトを {n} 個に設定"))
+        }
+        SetFrameBlend { on } => {
+            let old = std::mem::replace(&mut p.settings.frame_blend, on);
+            done(vec![SetFrameBlend { on: old }], cmd.clone(), None, format!("コマの補間(フレームブレンド)を{}", if on { "オン" } else { "オフ" }))
         }
         SetMasterGain { gain_db } => {
             if !gain_db.is_finite() || !(-60.0..=12.0).contains(&gain_db) {

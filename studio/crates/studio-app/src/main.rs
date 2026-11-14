@@ -1327,6 +1327,14 @@ impl Studio {
             let s = &self.editor.project.settings;
             ui.label(format!("{}×{}  {:.3} fps  {} Hz", s.width, s.height, s.frame_rate.fps(), s.sample_rate));
             ui.label(format!("長さ {}", self.editor.project.duration()));
+            let mut fb = self.editor.project.settings.frame_blend;
+            if ui
+                .checkbox(&mut fb, "コマの補間(フレームブレンド)")
+                .on_hover_text("フレームレートの低い動画やスロー再生で、前後のコマを混ぜてなめらかにします")
+                .changed()
+            {
+                self.run("コマの補間", vec![Command::SetFrameBlend { on: fb }]);
+            }
             ui.add_space(8.0);
             ui.weak("クリップを選ぶと、ここで位置・大きさ・不透明度・音量などを調整できます。");
             ui.add_space(8.0);
