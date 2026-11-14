@@ -550,8 +550,23 @@ impl Studio {
                 let width = params.get("width").and_then(|w| w.as_u64()).unwrap_or(640).clamp(64, 1920) as u32;
                 Done(self.frame_png(t, width).map(|b64| json!({"png_base64": b64, "time": t.secs_f64()})))
             }
-            "execute" | "import_file" => {
-                let (label, commands) = if method == "import_file" {
+            "get_subtitles" => {
+                let track = params.get("track").and_then(|x| x.as_u64()).map(Id);
+                let cues = studio_core::subtitle::cues_of(&self.editor.project, track);
+                Done(Ok(json!({"count": cues.len(), "srt": studio_core::subtitle::to_srt(&cues)})))
+            }
+            "execute" | "import_file" | "import_subtitles" => {
+                let (label, commands) = if method == "import_subtitles" {
+                    let Some(path) = params.get("path").and_then(|x| x.as_str()) else { return Done(Err("path を指定してください".into())) };
+                    let src = match std::fs::read(path) {
+                        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                        Err(e) => return Done(Err(format!("{path} を読めません: {e}"))),
+                    };
+                    match studio_core::subtitle::parse(&src) {
+                        Ok(cues) => ("字幕の読み込み".to_string(), studio_core::subtitle::import_commands(&self.editor.project, &cues)),
+                        Err(e) => return Done(Err(e)),
+                    }
+                } else if method == "import_file" {
                     let Some(path) = params.get("path").and_then(|x| x.as_str()) else { return Done(Err("path を指定してください".into())) };
                     let path = PathBuf::from(path);
                     let kind = match probe(&path) {
@@ -987,6 +1002,43 @@ impl Studio {
         }
     }
 
+    fn import_subtitles(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("字幕", &["srt", "vtt"]).pick_file() else { return };
+        let src = match std::fs::read(&path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => {
+                self.status = format!("読めません: {e}");
+                return;
+            }
+        };
+        match studio_core::subtitle::parse(&src) {
+            Ok(cues) => {
+                let n = cues.len();
+                let cmds = studio_core::subtitle::import_commands(&self.editor.project, &cues);
+                if self.run("字幕の読み込み", cmds).is_some() {
+                    self.status = format!("字幕を {n} 個読み込みました(下寄せの文字のクリップ)");
+                }
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn export_subtitles(&mut self) {
+        let p = &self.editor.project;
+        // 文字のクリップを選んでいれば、そのトラックだけ
+        let track = self.selected.and_then(|id| p.find_clip(id)).map(|(ti, _)| p.tracks[ti].id).filter(|t| !studio_core::subtitle::cues_of(p, Some(*t)).is_empty());
+        let cues = studio_core::subtitle::cues_of(p, track);
+        if cues.is_empty() {
+            self.status = "文字のクリップがありません".into();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().add_filter("SRT 字幕", &["srt"]).set_file_name("subtitles.srt").save_file() else { return };
+        self.status = match std::fs::write(&path, studio_core::subtitle::to_srt(&cues)) {
+            Ok(()) => format!("字幕を {} 個書き出しました: {}", cues.len(), path.display()),
+            Err(e) => format!("書き出せません: {e}"),
+        };
+    }
+
     fn add_text(&mut self) {
         let kind = AssetKind::Text { text: "テキスト".into(), style: studio_core::project::TextStyle { outline: 4.0, ..Default::default() } };
         if let Some(created) = self.run("文字の追加", vec![ImportAsset { name: "文字「テキスト」".into(), path: String::new(), kind, id: None }]) {
@@ -1110,6 +1162,16 @@ impl Studio {
                 if ui.button("+ 文字").clicked() {
                     self.add_text();
                 }
+                ui.menu_button("字幕", |ui| {
+                    if ui.button("字幕ファイルを読み込む(SRT・VTT)").clicked() {
+                        ui.close();
+                        self.import_subtitles();
+                    }
+                    if ui.button("字幕を SRT で書き出す").on_hover_text("文字のクリップを字幕として書き出します(文字のクリップを選んでいれば、そのトラックだけ)").clicked() {
+                        ui.close();
+                        self.export_subtitles();
+                    }
+                });
                 ui.toggle_value(&mut self.show_mixer, "ミキサー");
                 if ui.checkbox(&mut self.use_proxies, "軽量表示").on_hover_text("プロキシ(高さ 540 の軽い代わりの動画)がある動画は、プレビューでそれを使う。書き出しは常に元の動画").changed() {
                     self.renderer.set_use_proxies(self.use_proxies);

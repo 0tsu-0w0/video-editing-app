@@ -11,6 +11,7 @@ pub mod command;
 pub mod editor;
 pub mod eval;
 pub mod project;
+pub mod subtitle;
 pub mod time;
 
 pub use command::{Command, EditError};
