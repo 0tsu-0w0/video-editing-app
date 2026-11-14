@@ -1327,6 +1327,45 @@ impl Studio {
             let s = &self.editor.project.settings;
             ui.label(format!("{}×{}  {:.3} fps  {} Hz", s.width, s.height, s.frame_rate.fps(), s.sample_rate));
             ui.label(format!("長さ {}", self.editor.project.duration()));
+            // 画面の大きさとフレームレート(縦長のショート動画など)
+            let (w0, h0, r0) = (s.width, s.height, s.frame_rate);
+            let sizes: [(&str, u32, u32); 7] = [
+                ("横 1920×1080(フル HD)", 1920, 1080),
+                ("横 1280×720", 1280, 720),
+                ("横 3840×2160(4K)", 3840, 2160),
+                ("縦 1080×1920(ショート・リール)", 1080, 1920),
+                ("縦 720×1280", 720, 1280),
+                ("正方形 1080×1080", 1080, 1080),
+                ("4:5 1080×1350", 1080, 1350),
+            ];
+            let rates: [(&str, u32, u32); 7] = [("23.976", 24000, 1001), ("24", 24, 1), ("25", 25, 1), ("29.97", 30000, 1001), ("30", 30, 1), ("50", 50, 1), ("60", 60, 1)];
+            let mut cmd = None;
+            egui::Grid::new("project_settings").num_columns(2).spacing([6.0, 4.0]).show(ui, |ui| {
+                ui.label("画面");
+                let cur = sizes.iter().find(|x| (x.1, x.2) == (w0, h0)).map_or(format!("{w0}×{h0}"), |x| x.0.to_string());
+                egui::ComboBox::from_id_salt("proj_size").selected_text(cur).width(200.0).show_ui(ui, |ui| {
+                    for (n, w, h) in sizes {
+                        if ui.selectable_label((w, h) == (w0, h0), n).clicked() && (w, h) != (w0, h0) {
+                            cmd = Some(Command::SetSettings { width: Some(w), height: Some(h), frame_rate: None, sample_rate: None });
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("フレームレート");
+                let cur = rates.iter().find(|x| studio_core::Rate::new(x.1, x.2) == r0).map_or(format!("{:.3}", r0.fps()), |x| x.0.to_string());
+                egui::ComboBox::from_id_salt("proj_rate").selected_text(format!("{cur} fps")).width(200.0).show_ui(ui, |ui| {
+                    for (n, num, den) in rates {
+                        let r = studio_core::Rate::new(num, den);
+                        if ui.selectable_label(r == r0, format!("{n} fps")).clicked() && r != r0 {
+                            cmd = Some(Command::SetSettings { width: None, height: None, frame_rate: Some(r), sample_rate: None });
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+            if let Some(c) = cmd {
+                self.run("プロジェクトの設定", vec![c]);
+            }
             let mut fb = self.editor.project.settings.frame_blend;
             if ui
                 .checkbox(&mut fb, "コマの補間(フレームブレンド)")
