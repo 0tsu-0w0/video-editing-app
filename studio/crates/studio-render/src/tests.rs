@@ -606,3 +606,77 @@ fn preview_with_proxy_matches_original_placement() {
     let (a, b) = (edge(&orig), edge(&prox));
     assert!(a.abs_diff(b) <= 1, "境目 {a} / {b}");
 }
+
+#[test]
+fn color_blur_and_chroma_key_render() {
+    use studio_core::project::ChromaKey;
+    let d = dir();
+    // 左半分が緑、右半分が赤の画像
+    let path = d.join("green_red.png");
+    let mut buf = Vec::new();
+    for _y in 0..200 {
+        for x in 0..200 {
+            buf.extend_from_slice(if x < 100 { &[0, 255, 0, 255] } else { &[255, 0, 0, 255] });
+        }
+    }
+    image::save_buffer(&path, &buf, 200, 200, image::ExtendedColorType::Rgba8).unwrap();
+    let mut ed = Editor::new(Project::default());
+    ed.execute(SetSettings { width: Some(W), height: Some(H), frame_rate: None, sample_rate: None }, Origin::User).unwrap();
+    let o = ed
+        .transaction(
+            "準備",
+            vec![
+                AddTrack { kind: TrackKind::Video, name: None, index: None, id: None },
+                ImportAsset { name: "gr".into(), path: path.to_string_lossy().into(), kind: studio_media::probe(&path).unwrap(), id: None },
+            ],
+            Origin::User,
+        )
+        .unwrap();
+    let [tr, a] = o.created[..] else { panic!() };
+    let c = ed.execute(AddClip { track: tr, asset: a, start: s(0.0), duration: Some(s(2.0)), source_in: None, id: None }, Origin::User).unwrap().created[0];
+    let mut r = Renderer::new(Gpu::new(None).unwrap());
+    let px = |img: &[u8], x: i32, y: i32| {
+        let i = (((H as i32 / 2 + y) as u32 * W + (W as i32 / 2 + x) as u32) * 4) as usize;
+        (img[i + 2] as i32, img[i + 1] as i32, img[i] as i32)
+    };
+    let near = |a: (i32, i32, i32), b: (i32, i32, i32)| (a.0 - b.0).abs() <= 3 && (a.1 - b.1).abs() <= 3 && (a.2 - b.2).abs() <= 3;
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    assert!(near(px(&img, -50, 0), (0, 255, 0)) && near(px(&img, 50, 0), (255, 0, 0)));
+
+    // クロマキー(緑): 緑は透明になり(背景の黒)、赤は残る
+    let key = ChromaKey { color: "#00FF00".into(), tolerance: 0.25, softness: 0.1, spill: 0.5 };
+    ed.execute(SetChromaKey { clip: c, key: Some(key) }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    assert!(near(px(&img, -50, 0), (0, 0, 0)), "緑が残っている {:?}", px(&img, -50, 0));
+    assert!(near(px(&img, 50, 0), (255, 0, 0)));
+    ed.execute(SetChromaKey { clip: c, key: None }, Origin::User).unwrap();
+
+    // 色相 120 度: 赤 → 緑、緑 → 青
+    ed.execute(SetParam { clip: c, param: "hue".into(), value: 120.0 }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    assert!(near(px(&img, 50, 0), (0, 255, 0)), "色相 {:?}", px(&img, 50, 0));
+    assert!(near(px(&img, -50, 0), (0, 0, 255)));
+    ed.execute(SetParam { clip: c, param: "hue".into(), value: 0.0 }, Origin::User).unwrap();
+
+    // 彩度 -1: 赤は灰色(輝度 0.299 → 76)
+    ed.execute(SetParam { clip: c, param: "saturation".into(), value: -1.0 }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    assert!(near(px(&img, 50, 0), (76, 76, 76)), "彩度 {:?}", px(&img, 50, 0));
+    // 明るさ +0.2 も重ねる: 76 + 51
+    ed.execute(SetParam { clip: c, param: "brightness".into(), value: 0.2 }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    assert!(near(px(&img, 50, 0), (127, 127, 127)), "明るさ {:?}", px(&img, 50, 0));
+    ed.execute(SetParam { clip: c, param: "saturation".into(), value: 0.0 }, Origin::User).unwrap();
+    ed.execute(SetParam { clip: c, param: "brightness".into(), value: 0.0 }, Origin::User).unwrap();
+
+    // ぼかし 20: 境目はおよそ半々、離れた所は元の色
+    ed.execute(SetParam { clip: c, param: "blur".into(), value: 20.0 }, Origin::User).unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    let (rr, gg, _) = px(&img, 0, 0);
+    assert!((90..=170).contains(&rr) && (90..=170).contains(&gg), "境目 {rr},{gg}");
+    assert!(near(px(&img, -60, 0), (0, 255, 0)) && near(px(&img, 60, 0), (255, 0, 0)));
+    // 取り消しで元に戻る
+    ed.undo().unwrap();
+    let img = r.render_bgra(&ed.project, s(1.0)).unwrap();
+    assert!(near(px(&img, 0, 0), (255, 0, 0)) || near(px(&img, -1, 0), (0, 255, 0)));
+}

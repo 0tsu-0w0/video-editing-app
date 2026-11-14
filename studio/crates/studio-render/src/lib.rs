@@ -217,6 +217,15 @@ fn mask_cb(l: &studio_core::eval::Layer, w: u32, h: u32) -> gpu::MaskCb {
         };
         m.wipe = [n, q as f32, 0.0, 0.0];
     }
+    let f = &l.fx;
+    m.color = [f.brightness as f32, f.contrast as f32, f.saturation as f32, f.hue.to_radians() as f32];
+    m.key2[3] = f.blur as f32;
+    if let Some((c, tol, soft, spill)) = l.key {
+        m.key = [c[0] as f32, c[1] as f32, c[2] as f32, 1.0];
+        m.key2[0] = tol as f32;
+        m.key2[1] = soft as f32;
+        m.key2[2] = spill as f32;
+    }
     m
 }
 

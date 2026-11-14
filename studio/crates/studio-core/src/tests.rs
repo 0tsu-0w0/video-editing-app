@@ -202,7 +202,7 @@ fn keyframes_interpolate_and_survive_split() {
     for bad in [
         SetKey { clip: c, param: "opacity".into(), time: s(1.0), value: 2.0, interp: Interp::Linear },
         SetKey { clip: c, param: "x".into(), time: s(9.0), value: 0.0, interp: Interp::Linear },
-        SetKey { clip: c, param: "blur".into(), time: s(1.0), value: 0.0, interp: Interp::Linear },
+        SetKey { clip: c, param: "glow".into(), time: s(1.0), value: 0.0, interp: Interp::Linear },
     ] {
         assert!(ed.execute(bad, Origin::Ai).is_err());
     }
@@ -492,4 +492,42 @@ fn transitions_crossfade_slide_and_masks() {
     assert_eq!(p2, ed.project);
     ed.execute(SetMask { clip: b, mask: None }, Origin::User).unwrap();
     assert!(layers_at(&ed.project, s(5.5)).last().unwrap().mask.is_none());
+}
+
+#[test]
+fn chroma_key_and_color_params_validate_split_and_undo() {
+    let (mut ed, v1, _v2, a1, movie, _img) = setup();
+    let c = ed.execute(AddClip { track: v1, asset: movie, start: s(0.0), duration: Some(s(4.0)), source_in: None, id: None }, Origin::User).unwrap().created[0];
+    let key = ChromaKey { color: "#00FF00".into(), tolerance: 0.3, softness: 0.1, spill: 0.5 };
+    // 色が読めない・範囲外は理由つきで断る
+    let bad = ed.execute(SetChromaKey { clip: c, key: Some(ChromaKey { color: "green".into(), ..key.clone() }) }, Origin::Ai).unwrap_err();
+    assert!(bad.to_string().contains("#00FF00"), "{bad}");
+    assert!(ed.execute(SetChromaKey { clip: c, key: Some(ChromaKey { tolerance: 2.0, ..key.clone() }) }, Origin::Ai).is_err());
+    // 音声トラックのクリップには付けられない
+    let ac = ed.execute(AddClip { track: a1, asset: movie, start: s(0.0), duration: Some(s(1.0)), source_in: None, id: None }, Origin::User).unwrap().created[0];
+    assert!(ed.execute(SetChromaKey { clip: ac, key: Some(key.clone()) }, Origin::User).is_err());
+
+    ed.execute(SetChromaKey { clip: c, key: Some(key.clone()) }, Origin::User).unwrap();
+    ed.execute(SetKey { clip: c, param: "hue".into(), time: s(0.0), value: 0.0, interp: Interp::Linear }, Origin::User).unwrap();
+    ed.execute(SetKey { clip: c, param: "hue".into(), time: s(4.0), value: 180.0, interp: Interp::Linear }, Origin::User).unwrap();
+    ed.execute(SetParam { clip: c, param: "blur".into(), value: 12.0 }, Origin::User).unwrap();
+    assert!(ed.execute(SetParam { clip: c, param: "saturation".into(), value: 3.0 }, Origin::User).is_err(), "範囲外");
+    let l = layers_at(&ed.project, s(2.0)).into_iter().find(|l| l.clip == c).unwrap();
+    assert_eq!(l.key, Some(([0.0, 1.0, 0.0], 0.3, 0.1, 0.5)));
+    assert!((l.fx.hue - 90.0).abs() < 1e-6 && l.fx.blur == 12.0);
+
+    // 分割しても両方に残る
+    ed.execute(SplitClip { clip: c, at: s(2.0), new_id: None }, Origin::User).unwrap();
+    let keyed = ed.project.tracks.iter().flat_map(|t| &t.clips).filter(|x| x.key.is_some()).count();
+    assert_eq!(keyed, 2);
+    // 保存・読み込みで変わらない
+    let j = serde_json::to_string(&ed.project).unwrap();
+    let back: Project = serde_json::from_str(&j).unwrap();
+    assert_eq!(back, ed.project);
+    // 外して、取り消すと戻る
+    ed.undo();
+    ed.execute(SetChromaKey { clip: c, key: None }, Origin::User).unwrap();
+    assert!(ed.project.clip(c).unwrap().key.is_none());
+    ed.undo();
+    assert_eq!(ed.project.clip(c).unwrap().key, Some(key));
 }

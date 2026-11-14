@@ -128,6 +128,10 @@ struct Studio {
     person_part: &'static str,
     /// プレビューのクリックで四隅を指定中(貼り付けるクリップ、用途、指定済みの点)
     pick_corners: Option<(Id, PinPick, Vec<(f64, f64)>)>,
+    /// クロマキーの色をプレビューから取る対象のクリップ
+    pick_key: Option<Id>,
+    /// クロマキーのスライダーを動かしている間の値(確定前のプレビュー用)
+    key_preview: Option<(Id, Option<studio_core::project::ChromaKey>)>,
     /// ミキサーの窓を出すか
     show_mixer: bool,
     /// プレビューでプロキシを使うか
@@ -200,6 +204,8 @@ impl Studio {
             pick_person: None,
             person_part: "head",
             pick_corners: None,
+            pick_key: None,
+            key_preview: None,
             use_proxies: true,
             proxy_queue: VecDeque::new(),
             proxy_job: None,
@@ -1414,49 +1420,20 @@ impl Studio {
                 !audio_param && !(matches!(*name, "rot_x" | "rot_y") && !is_model) && !(name.starts_with("mask_") && !has_mask)
             })
             .collect();
-        egui::Grid::new(("params", id)).num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
-            for (name, label) in visible {
-                let param = clip.params.get(name).unwrap();
-                let (_, lo, hi) = *PARAMS.iter().find(|p| p.0 == name).unwrap();
-                let range = match name {
-                    "x" | "y" => -4000.0..=4000.0,
-                    "scale" => 0.0..=8.0,
-                    "rotation" | "rot_x" | "rot_y" => -360.0..=360.0,
-                    "mask_x" | "mask_y" => -4000.0..=4000.0,
-                    // マスクの大きさは素材の大きさに合わせた範囲にする(細かく動かせるように)
-                    "mask_w" | "mask_h" => 0.0..=(src_extent * 1.5).max(100.0),
-                    "mask_feather" => 0.0..=400.0,
-                    "volume" => 0.0..=4.0,
-                    _ => lo..=hi,
-                };
-                let mut v = match &self.editing {
-                    Some((c, n, v)) if *c == id && n == name => *v,
-                    _ => param.eval(local),
-                };
-                {
-                    ui.label(label);
-                    let keyed = !param.keys.is_empty();
-                    let r = ui.add(egui::Slider::new(&mut v, range).clamping(egui::SliderClamping::Never));
-                    if r.changed() {
-                        self.editing = Some((id, name.to_string(), v.clamp(lo, hi)));
-                    }
-                    let finished = r.drag_stopped() || (r.changed() && !r.dragged()) || r.lost_focus();
-                    if finished {
-                        if let Some((_, _, val)) = self.editing.take() {
-                            commit = Some(if keyed {
-                                SetKey { clip: id, param: name.into(), time: local, value: val, interp: Default::default() }
-                            } else {
-                                SetParam { clip: id, param: name.into(), value: val }
-                            });
-                        }
-                    }
-                    if ui.small_button(if keyed { "◆" } else { "◇" }).on_hover_text(if keyed { "キーフレームあり。押すと再生位置にキーフレームを置く" } else { "再生位置にキーフレームを置く" }).clicked() {
-                        commit = Some(SetKey { clip: id, param: name.into(), time: local, value: v.clamp(lo, hi), interp: Default::default() });
-                    }
-                    ui.end_row();
+        if let Some(c) = self.param_grid(ui, "params", id, &clip, local, &visible, src_extent) {
+            commit = Some(c);
+        }
+        if !on_audio {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new("色・ぼかし・クロマキー").id_salt(("fx", id)).show(ui, |ui| {
+                let rows = [("brightness", "明るさ"), ("contrast", "コントラスト"), ("saturation", "彩度"), ("hue", "色相"), ("blur", "ぼかし")];
+                if let Some(c) = self.param_grid(ui, "fx_params", id, &clip, local, &rows, src_extent) {
+                    commit = Some(c);
                 }
-            }
-        });
+                ui.add_space(4.0);
+                self.chroma_key_ui(ui, id, &clip);
+            });
+        }
         if on_audio {
             ui.add_space(4.0);
             if ui.button("ミキサーを開く(トラックの音量・エフェクト)").clicked() {
@@ -1535,20 +1512,163 @@ impl Studio {
         }
     }
 
+    /// 値の欄(名前・スライダー・キーフレームのボタン)。確定した操作を返す。
+    fn param_grid(&mut self, ui: &mut egui::Ui, key: &str, id: Id, clip: &studio_core::project::Clip, local: Time, rows: &[(&str, &str)], src_extent: f64) -> Option<Command> {
+        let mut commit: Option<Command> = None;
+        egui::Grid::new((key, id)).num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
+            for &(name, label) in rows {
+                let param = clip.params.get(name).unwrap();
+                let (_, lo, hi) = *PARAMS.iter().find(|p| p.0 == name).unwrap();
+                let range = match name {
+                    "x" | "y" => -4000.0..=4000.0,
+                    "scale" => 0.0..=8.0,
+                    "rotation" | "rot_x" | "rot_y" => -360.0..=360.0,
+                    "mask_x" | "mask_y" => -4000.0..=4000.0,
+                    // マスクの大きさは素材の大きさに合わせた範囲にする(細かく動かせるように)
+                    "mask_w" | "mask_h" => 0.0..=(src_extent * 1.5).max(100.0),
+                    "mask_feather" => 0.0..=400.0,
+                    "hue" => -180.0..=180.0,
+                    "blur" => 0.0..=100.0,
+                    "volume" => 0.0..=4.0,
+                    _ => lo..=hi,
+                };
+                let mut v = match &self.editing {
+                    Some((c, n, v)) if *c == id && n == name => *v,
+                    _ => param.eval(local),
+                };
+                {
+                    ui.label(label);
+                    let keyed = !param.keys.is_empty();
+                    let r = ui.add(egui::Slider::new(&mut v, range).clamping(egui::SliderClamping::Never));
+                    if r.changed() {
+                        self.editing = Some((id, name.to_string(), v.clamp(lo, hi)));
+                    }
+                    let finished = r.drag_stopped() || (r.changed() && !r.dragged()) || r.lost_focus();
+                    if finished {
+                        if let Some((_, _, val)) = self.editing.take() {
+                            commit = Some(if keyed {
+                                SetKey { clip: id, param: name.into(), time: local, value: val, interp: Default::default() }
+                            } else {
+                                SetParam { clip: id, param: name.into(), value: val }
+                            });
+                        }
+                    }
+                    if ui.small_button(if keyed { "◆" } else { "◇" }).on_hover_text(if keyed { "キーフレームあり。押すと再生位置にキーフレームを置く" } else { "再生位置にキーフレームを置く" }).clicked() {
+                        commit = Some(SetKey { clip: id, param: name.into(), time: local, value: v.clamp(lo, hi), interp: Default::default() });
+                    }
+                    ui.end_row();
+                }
+            }
+        });
+        commit
+    }
+
+    /// プレビューの位置 (sx, sy)(画面中央が原点のピクセル)の色を、クリップのクロマキーの色にする。
+    /// 色はクロマキーと色の調整を外して描いた画面から取る。
+    fn pick_key_color(&mut self, project: &Project, target: Id, sx: f64, sy: f64) -> Result<String, String> {
+        use studio_core::project::ChromaKey;
+        let mut p = project.clone();
+        let (ti, ci) = p.find_clip(target).ok_or("クリップが見つかりません")?;
+        let c = &mut p.tracks[ti].clips[ci];
+        let old = c.key.clone();
+        c.key = None;
+        for n in ["brightness", "contrast", "saturation", "hue", "blur"] {
+            *c.params.get_mut(n).unwrap() = studio_core::project::Param::constant(0.0);
+        }
+        let (w, h) = (p.settings.width as i64, p.settings.height as i64);
+        let (x, y) = ((sx + w as f64 / 2.0).floor() as i64, (sy + h as f64 / 2.0).floor() as i64);
+        if !(0..w).contains(&x) || !(0..h).contains(&y) {
+            return Err("画面の外です".into());
+        }
+        let bgra = self.renderer.render_bgra(&p, self.playhead)?;
+        let i = ((y * w + x) * 4) as usize;
+        let color = format!("#{:02X}{:02X}{:02X}", bgra[i + 2], bgra[i + 1], bgra[i]);
+        let key = match old {
+            Some(k) => ChromaKey { color: color.clone(), ..k },
+            None => ChromaKey { color: color.clone(), tolerance: 0.25, softness: 0.1, spill: 0.5 },
+        };
+        self.run("クロマキーの色", vec![Command::SetChromaKey { clip: target, key: Some(key) }]).ok_or_else(|| self.status.clone())?;
+        Ok(format!("クロマキーの色を {color} にしました"))
+    }
+
+    /// クロマキーの欄(有効・色・スポイト・範囲など)。
+    fn chroma_key_ui(&mut self, ui: &mut egui::Ui, id: Id, clip: &studio_core::project::Clip) {
+        use studio_core::project::ChromaKey;
+        let before = clip.key.clone();
+        let mut key = before.clone();
+        let mut on = key.is_some();
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut on, "クロマキー");
+            let picking = self.pick_key == Some(id);
+            if ui.add(egui::Button::selectable(picking, "スポイト")).on_hover_text("プレビューで透明にしたい色(グリーンバックの緑など)をクリック").clicked() {
+                self.pick_key = if picking { None } else { Some(id) };
+                self.pick_corners = None;
+                self.pick_track = None;
+                if !picking {
+                    self.status = "プレビューで、透明にしたい色の所をクリックしてください".into();
+                }
+            }
+        });
+        if on && key.is_none() {
+            key = Some(ChromaKey { color: "#00FF00".into(), tolerance: 0.25, softness: 0.1, spill: 0.5 });
+        }
+        if !on {
+            key = None;
+        }
+        let mut finished = false;
+        if let Some(k) = key.as_mut() {
+            let mut rgb = k.rgb();
+            egui::Grid::new(("key", id)).num_columns(2).spacing([6.0, 4.0]).show(ui, |ui| {
+                ui.label("色");
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    k.color = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+                    finished = true;
+                }
+                ui.end_row();
+                for (label, v) in [("範囲", &mut k.tolerance), ("なめらかさ", &mut k.softness), ("色かぶり除去", &mut k.spill)] {
+                    ui.label(label);
+                    let r = ui.add(egui::Slider::new(v, 0.0..=1.0));
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) || r.lost_focus() {
+                        finished = true;
+                    }
+                    ui.end_row();
+                }
+            });
+            // ドラッグ中もプレビューに反映する(確定は離したとき)
+            if key != before && !finished {
+                self.key_preview = Some((id, key.clone()));
+            }
+        }
+        if key.is_none() != before.is_none() {
+            finished = true;
+        }
+        if finished && key != before {
+            self.key_preview = None;
+            self.run("クロマキー", vec![Command::SetChromaKey { clip: id, key }]);
+        }
+    }
+
     fn preview(&mut self, ui: &mut egui::Ui) {
         // スライダー操作中の値は、確定前でもプレビューに反映する
-        let project: Arc<Project> = match &self.editing {
-            Some((id, name, v)) => {
+        let project: Arc<Project> = match (&self.editing, &self.key_preview) {
+            (Some(_), _) | (_, Some(_)) => {
                 let mut p = self.editor.project.clone();
-                if let Some((ti, ci)) = p.find_clip(*id) {
-                    let slot = p.tracks[ti].clips[ci].params.get_mut(name).unwrap();
-                    if slot.keys.is_empty() {
-                        slot.value = *v;
+                if let Some((id, name, v)) = &self.editing {
+                    if let Some((ti, ci)) = p.find_clip(*id) {
+                        let slot = p.tracks[ti].clips[ci].params.get_mut(name).unwrap();
+                        if slot.keys.is_empty() {
+                            slot.value = *v;
+                        }
+                    }
+                }
+                if let Some((id, k)) = &self.key_preview {
+                    if let Some((ti, ci)) = p.find_clip(*id) {
+                        p.tracks[ti].clips[ci].key = k.clone();
                     }
                 }
                 Arc::new(p)
             }
-            None => match &self.last_project {
+            (None, None) => match &self.last_project {
                 Some(p) if **p == self.editor.project => p.clone(),
                 _ => Arc::new(self.editor.project.clone()),
             },
@@ -1595,6 +1715,18 @@ impl Studio {
                         for p in pts {
                             ui.painter().circle_filled(p, 3.5, egui::Color32::from_rgb(0, 200, 255));
                         }
+                    }
+                }
+                if let Some(target) = self.pick_key {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    ui.painter().rect_stroke(img, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 220, 120)), egui::StrokeKind::Outside);
+                    if let Some(pos) = resp.clicked().then(|| resp.interact_pointer_pos()).flatten().filter(|p| img.contains(*p)) {
+                        self.pick_key = None;
+                        let (sx, sy) = to_screen(pos);
+                        self.status = match self.pick_key_color(&project, target, sx, sy) {
+                            Ok(msg) => msg,
+                            Err(e) => e,
+                        };
                     }
                 }
                 if let Some((target, mode, pts)) = self.pick_corners.clone() {

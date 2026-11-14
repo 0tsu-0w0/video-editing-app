@@ -316,6 +316,18 @@ pub struct ClipParams {
     pub mask_h: Param,
     #[serde(default = "zero_param")]
     pub mask_feather: Param,
+    /// 色の調整(すべて 0 で元のまま)。明るさ・コントラスト・彩度は -1〜1、色相は度
+    #[serde(default = "zero_param")]
+    pub brightness: Param,
+    #[serde(default = "zero_param")]
+    pub contrast: Param,
+    #[serde(default = "zero_param")]
+    pub saturation: Param,
+    #[serde(default = "zero_param")]
+    pub hue: Param,
+    /// ぼかしの半径(素材のピクセル)
+    #[serde(default = "zero_param")]
+    pub blur: Param,
 }
 
 fn zero_param() -> Param {
@@ -339,12 +351,17 @@ impl Default for ClipParams {
             mask_w: Param::constant(0.0),
             mask_h: Param::constant(0.0),
             mask_feather: Param::constant(0.0),
+            brightness: Param::constant(0.0),
+            contrast: Param::constant(0.0),
+            saturation: Param::constant(0.0),
+            hue: Param::constant(0.0),
+            blur: Param::constant(0.0),
         }
     }
 }
 
 /// 項目名と、値の範囲。
-pub const PARAMS: [(&str, f64, f64); 14] = [
+pub const PARAMS: [(&str, f64, f64); 19] = [
     ("x", -100_000.0, 100_000.0),
     ("y", -100_000.0, 100_000.0),
     ("scale", 0.0, 100.0),
@@ -359,6 +376,11 @@ pub const PARAMS: [(&str, f64, f64); 14] = [
     ("mask_w", 0.0, 100_000.0),
     ("mask_h", 0.0, 100_000.0),
     ("mask_feather", 0.0, 2_000.0),
+    ("brightness", -1.0, 1.0),
+    ("contrast", -1.0, 1.0),
+    ("saturation", -1.0, 1.0),
+    ("hue", -36_000.0, 36_000.0),
+    ("blur", 0.0, 500.0),
 ];
 
 impl ClipParams {
@@ -378,6 +400,11 @@ impl ClipParams {
             "mask_w" => &self.mask_w,
             "mask_h" => &self.mask_h,
             "mask_feather" => &self.mask_feather,
+            "brightness" => &self.brightness,
+            "contrast" => &self.contrast,
+            "saturation" => &self.saturation,
+            "hue" => &self.hue,
+            "blur" => &self.blur,
             _ => return None,
         })
     }
@@ -397,6 +424,11 @@ impl ClipParams {
             "mask_w" => &mut self.mask_w,
             "mask_h" => &mut self.mask_h,
             "mask_feather" => &mut self.mask_feather,
+            "brightness" => &mut self.brightness,
+            "contrast" => &mut self.contrast,
+            "saturation" => &mut self.saturation,
+            "hue" => &mut self.hue,
+            "blur" => &mut self.blur,
             _ => return None,
         })
     }
@@ -431,6 +463,54 @@ pub struct Clip {
     pub transition_in: Option<Transition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_out: Option<Transition>,
+    /// クロマキー(指定した色を透明にする)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<ChromaKey>,
+}
+
+/// クロマキー。色が key の色に近いほど透明にする。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChromaKey {
+    /// 透明にする色("#RRGGBB")
+    pub color: String,
+    /// 透明にする範囲(0〜1。大きいほど広い)
+    #[serde(default = "default_tolerance")]
+    pub tolerance: f64,
+    /// 境目のなめらかさ(0〜1)
+    #[serde(default = "default_softness")]
+    pub softness: f64,
+    /// 縁に残る色かぶりを抑える強さ(0〜1)
+    #[serde(default = "default_spill")]
+    pub spill: f64,
+}
+
+fn default_tolerance() -> f64 {
+    0.25
+}
+fn default_softness() -> f64 {
+    0.1
+}
+fn default_spill() -> f64 {
+    0.5
+}
+
+impl ChromaKey {
+    pub fn rgb(&self) -> [u8; 3] {
+        let c = parse_rgba(&self.color).unwrap_or([0, 255, 0, 255]);
+        [c[0], c[1], c[2]]
+    }
+    pub fn check(&self) -> Result<(), String> {
+        if parse_rgba(&self.color).is_none() {
+            return Err(format!("クロマキーの色 \"{}\" が読めません(\"#00FF00\" のように書いてください)", self.color));
+        }
+        for (n, v) in [("tolerance", self.tolerance), ("softness", self.softness), ("spill", self.spill)] {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("クロマキーの {n} は 0〜1 にしてください(今は {v})"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +742,9 @@ impl Project {
                 }
                 let a = self.assets.get(&c.asset).ok_or(format!("クリップ {} の素材がありません", c.id))?;
                 check_pin(&c.pin).map_err(|e| format!("クリップ {}: {e}", c.id))?;
+                if let Some(k) = &c.key {
+                    k.check().map_err(|e| format!("クリップ {}: {e}", c.id))?;
+                }
                 let td = |t: &Option<Transition>| t.map_or(Time::ZERO, |t| t.duration);
                 if c.transition_in.is_some_and(|t| t.duration <= Time::ZERO) || c.transition_out.is_some_and(|t| t.duration <= Time::ZERO) || td(&c.transition_in) + td(&c.transition_out) > c.duration {
                     return Err(format!("クリップ {} のトランジションの長さが不正です", c.id));

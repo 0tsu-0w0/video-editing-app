@@ -47,6 +47,8 @@ pub fn command_schema() -> Value {
                 "transition": format!("(任意){{\"kind\": 種類, \"duration\": 秒}}。種類: {}", crate::project::TRANSITION_KINDS.iter().map(|k| format!("{}({})", k.1, k.2)).collect::<Vec<_>>().join(" / "))}},
             {"command": "set_mask", "description": "クリップにマスクを付ける(形の内側だけ表示。invert で外側だけ)。mask を省略すると外す。位置と大きさは params の mask_x / mask_y(素材の中央からのピクセル)・mask_w / mask_h(幅・高さ)・mask_feather(ぼかし)で、キーフレームも置ける。初めて付けると素材の半分の大きさになる", "args": {
                 "clip": "クリップ ID", "mask": "(任意){\"shape\": \"rect\" または \"ellipse\", \"invert\": false}"}},
+            {"command": "set_chroma_key", "description": "クロマキー: 指定した色(グリーンバックの緑など)に近い所を透明にする。key を省略すると外す。色の調整は params の brightness / contrast / saturation(-1〜1、0 で元のまま)・hue(色相、度)、ぼかしは blur(半径ピクセル)で、どれもキーフレームを置ける", "args": {
+                "clip": "クリップ ID", "key": "(任意){\"color\": \"#00FF00\", \"tolerance\": 0.25(透明にする範囲 0〜1), \"softness\": 0.1(境目のなめらかさ 0〜1), \"spill\": 0.5(縁の色かぶりを抑える強さ 0〜1)}"}},
             {"command": "set_pin", "description": "クリップの素材の四隅を画面上の位置に合わせて変形する(壁や机などの平面に貼る)。keys が空なら外す。四隅がある間は x / y / scale / rotation は使われない", "args": {
                 "clip": "クリップ ID", "keys": "[{\"time\": クリップ開始からの秒, \"corners\": [[左上x,左上y],[右上x,右上y],[右下x,右下y],[左下x,左下y]]}, ...](位置は画面中央が原点のピクセル。キーの間は直線で補間)"}},
             {"command": "set_track_audio", "description": "音声トラックのミキサー: 音量(dB)・左右のバランス・ソロ(省略した項目はそのまま)", "args": {
@@ -74,6 +76,8 @@ pub fn command_schema() -> Value {
             {"command": "set_transition", "clip": 9, "edge": "in", "transition": {"kind": "fade", "duration": 1.0}},
             {"command": "set_mask", "clip": 9, "mask": {"shape": "ellipse"}},
             {"command": "set_param", "clip": 9, "param": "mask_feather", "value": 40},
+            {"command": "set_chroma_key", "clip": 9, "key": {"color": "#00FF00", "tolerance": 0.3}},
+            {"command": "set_param", "clip": 9, "param": "saturation", "value": -0.5},
         ],
     })
 }
@@ -136,6 +140,8 @@ pub fn describe(p: &Project) -> Value {
                         let relevant = match t.kind {
                             TrackKind::Video if matches!(name, "rot_x" | "rot_y") => is_model,
                             TrackKind::Video if name.starts_with("mask_") => c.mask.is_some(),
+                            // 色の調整とぼかしは、使っているときだけ書く
+                            TrackKind::Video if matches!(name, "brightness" | "contrast" | "saturation" | "hue" | "blur") => pr.value != 0.0 || !pr.keys.is_empty(),
                             TrackKind::Video => !matches!(name, "volume" | "pan"),
                             TrackKind::Audio => matches!(name, "volume" | "pan"),
                         };
@@ -157,6 +163,9 @@ pub fn describe(p: &Project) -> Value {
                     }
                     if c.fade_out.0 > 0 {
                         extra.insert("fade_out".into(), json!(r3(c.fade_out)));
+                    }
+                    if let Some(k) = &c.key {
+                        extra.insert("chroma_key".into(), json!(k));
                     }
                     if let Some(m) = &c.mask {
                         extra.insert("mask".into(), json!(m));
@@ -306,7 +315,7 @@ mod tests {
             serde_json::from_value::<Command>(ex.clone()).unwrap();
         }
         let names: Vec<&str> = s["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask"] {
+        for n in ["add_track", "remove_track", "rename_track", "move_track", "set_track_flags", "add_clip", "remove_clip", "move_clip", "trim_clip", "split_clip", "set_param", "set_key", "remove_key", "remove_asset", "set_settings", "set_pin", "set_fade", "set_text", "set_track_audio", "set_track_effects", "set_master_gain", "set_transition", "set_mask", "set_chroma_key"] {
             assert!(names.contains(&n), "{n} の説明がない");
         }
         assert!(!names.iter().any(|n| n.starts_with("restore")), "内部用コマンドを公開しない");

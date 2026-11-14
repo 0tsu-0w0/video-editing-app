@@ -28,6 +28,22 @@ pub struct Layer {
     pub wipe: Option<(TransitionKind, f64)>,
     /// 同じ素材を同時に 2 か所で表示するときの区別(トランジション中の前のクリップは 1)
     pub slot: u8,
+    /// 色の調整とぼかし
+    pub fx: LayerFx,
+    /// クロマキー(色 0〜1、範囲、なめらかさ、色かぶりの抑え)
+    pub key: Option<([f64; 3], f64, f64, f64)>,
+}
+
+/// 時刻を評価した色の調整とぼかし(すべて 0 で元のまま)。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LayerFx {
+    pub brightness: f64,
+    pub contrast: f64,
+    pub saturation: f64,
+    /// 度
+    pub hue: f64,
+    /// ぼかしの半径(素材のピクセル)
+    pub blur: f64,
 }
 
 /// 時刻を評価したマスク(素材のピクセル、中心は素材の中央から)。
@@ -121,6 +137,17 @@ fn clip_layer(p: &Project, c: &Clip, t: Time, held: bool) -> Option<Layer> {
         }),
         wipe: if held { None } else { wipe },
         slot: held as u8,
+        fx: LayerFx {
+            brightness: pr.brightness.eval(local).clamp(-1.0, 1.0),
+            contrast: pr.contrast.eval(local).clamp(-1.0, 1.0),
+            saturation: pr.saturation.eval(local).clamp(-1.0, 1.0),
+            hue: pr.hue.eval(local),
+            blur: pr.blur.eval(local).clamp(0.0, 500.0),
+        },
+        key: c.key.as_ref().map(|k| {
+            let c = k.rgb();
+            ([c[0] as f64 / 255.0, c[1] as f64 / 255.0, c[2] as f64 / 255.0], k.tolerance, k.softness, k.spill)
+        }),
     })
 }
 

@@ -24,7 +24,61 @@ cbuffer Mask : register(b2) {
     float4 m_opt;    // 形(0 無し, 1 四角, 2 楕円)、反転、ぼかし、_
     float4 m_wipe;   // 種類(0 無し, 1 左→右, 2 右→左, 3 上→下, 4 下→上, 5 円)、見えている割合、_、_
     float4 m_size;   // 素材の幅・高さ
+    float4 f_color;  // 明るさ・コントラスト・彩度・色相(ラジアン)
+    float4 f_key;    // クロマキーの色、有効
+    float4 f_key2;   // 範囲・なめらかさ・色かぶりの抑え・ぼかしの半径(ピクセル)
 };
+// 素材を読む(乗算済みで返す)。ぼかしは黄金角で並べた 64 点の重み付き平均
+float4 fetch(float2 uv) {
+    float r = f_key2.w;
+    if (r < 0.25) {
+        float4 c = tex.SampleLevel(smp, uv, 0);
+        c.rgb *= c.a;
+        return c;
+    }
+    float4 acc = 0;
+    float wsum = 0;
+    [loop] for (int k = 0; k < 64; k++) {
+        float rr = sqrt((k + 0.5) / 64.0);
+        float a = k * 2.39996323;
+        float2 o = float2(cos(a), sin(a)) * (rr * r) / m_size.xy;
+        float w = exp(-2.0 * rr * rr);
+        float4 c = tex.SampleLevel(smp, uv + o, 0);
+        c.rgb *= c.a;
+        acc += c * w;
+        wsum += w;
+    }
+    return acc / wsum;
+}
+float2 chroma(float3 c) {
+    return float2(dot(c, float3(-0.1687, -0.3313, 0.5)), dot(c, float3(0.5, -0.4187, -0.0813)));
+}
+// クロマキーと色の調整(乗算済みを受け取り、乗算済みで返す)
+float4 shade(float4 pm) {
+    float a = pm.a;
+    float3 c = a > 1e-5 ? pm.rgb / a : 0;
+    float luma = dot(c, float3(0.299, 0.587, 0.114));
+    if (f_key.w > 0.5) {
+        float d = distance(chroma(c), chroma(f_key.rgb));
+        float t = f_key2.x * 0.5;
+        float s = max(f_key2.y * 0.5, 1e-3);
+        a *= smoothstep(t, t + s, d);
+        float sp = (1 - smoothstep(t, t + s * 2 + 0.15, d)) * f_key2.z;
+        c = lerp(c, luma, sp);
+    }
+    c += f_color.x;
+    float k = f_color.y >= 0 ? 1 + f_color.y * 2 : 1 + f_color.y;
+    c = (c - 0.5) * k + 0.5;
+    luma = dot(c, float3(0.299, 0.587, 0.114));
+    c = lerp(luma, c, 1 + f_color.z);
+    if (abs(f_color.w) > 1e-4) {
+        float3 ax = 0.57735027;
+        float cs = cos(f_color.w), sn = sin(f_color.w);
+        c = c * cs + cross(ax, c) * sn + ax * dot(ax, c) * (1 - cs);
+    }
+    c = saturate(c);
+    return float4(c * a, a);
+}
 float coverage(float e, float feather) {
     return feather > 0.5 ? saturate(e / feather + 0.5) : (e >= 0 ? 1.0 : 0.0);
 }
@@ -66,8 +120,7 @@ VSOut vsmain(uint id : SV_VertexID) {
     return o;
 }
 float4 psmain(VSOut i) : SV_Target {
-    float4 c = tex.Sample(smp, i.uv);   // 素材はストレートアルファ
-    c.rgb *= c.a;                       // 乗算済みにして重ねる
+    float4 c = shade(fetch(i.uv));      // 素材はストレートアルファ。乗算済みにして重ねる
     return c * (opacity * mask_at(i.uv));
 }
 
@@ -92,8 +145,7 @@ float4 ps_pin(VSOut i) : SV_Target {
     if (u.z <= 0) discard;
     float2 uv = u.xy / u.z;
     if (any(uv < 0) || any(uv > 1)) discard;
-    float4 c = tex.SampleLevel(smp, uv, 0);
-    c.rgb *= c.a;
+    float4 c = shade(fetch(uv));
     return c * (pin_opacity * mask_at(uv));
 }
 "#;
@@ -172,6 +224,12 @@ pub struct MaskCb {
     pub wipe: [f32; 4],
     /// 素材の幅・高さ
     pub size: [f32; 4],
+    /// 明るさ・コントラスト・彩度(-1〜1)・色相(ラジアン)
+    pub color: [f32; 4],
+    /// クロマキーの色(0〜1)と、有効(0/1)
+    pub key: [f32; 4],
+    /// クロマキーの範囲・なめらかさ・色かぶりの抑え、ぼかしの半径(素材のピクセル)
+    pub key2: [f32; 4],
 }
 
 /// 単位正方形(u, v ∈ [0,1])を四角形 q(左上・右上・右下・左下)へ写す射影変換。

@@ -181,6 +181,12 @@ pub enum Command {
         mask: Option<Mask>,
     },
     /// トランジションを付ける・外す(edge: "in" は始まり、"out" は終わり。transition が無ければ外す)
+    /// クロマキーを付ける・外す(key が無ければ外す)
+    SetChromaKey {
+        clip: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<ChromaKey>,
+    },
     SetTransition {
         clip: Id,
         edge: Edge,
@@ -262,6 +268,7 @@ impl Command {
             Command::SetPin { .. } => "set_pin",
             Command::SetMask { .. } => "set_mask",
             Command::SetTransition { .. } => "set_transition",
+            Command::SetChromaKey { .. } => "set_chroma_key",
             Command::SetParam { .. } => "set_param",
             Command::SetKey { .. } => "set_key",
             Command::RemoveKey { .. } => "remove_key",
@@ -494,7 +501,7 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 (None, None) => Time::from_secs_f64(5.0),
             };
             let id = take_id(p, id)?;
-            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None };
+            let clip = Clip { id, asset, start, duration, source_in, params: ClipParams::default(), fade_in: Time::ZERO, fade_out: Time::ZERO, pin: vec![], mask: None, transition_in: None, transition_out: None, key: None };
             check_clip_time(p, &clip)?;
             insert_clip(track_mut(p, track)?, clip)?;
             done(
@@ -721,6 +728,24 @@ pub fn apply(p: &mut Project, cmd: &Command) -> Result<Applied, EditError> {
                 ),
                 None => format!("クリップ {clip} の{side}のトランジションを外す"),
             };
+            done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)
+        }
+        SetChromaKey { clip, key } => {
+            let (t, ci) = clip_mut(p, clip)?;
+            unlocked(t)?;
+            if t.kind != TrackKind::Video {
+                return err("invalid", "クロマキーは映像トラックのクリップだけです");
+            }
+            if let Some(k) = &key {
+                k.check().map_err(|m| EditError { code: "invalid", message: m })?;
+            }
+            let tid = t.id;
+            let old = t.clips[ci].clone();
+            let s = match &key {
+                Some(k) => format!("クリップ {clip} に {} のクロマキー(範囲 {:.2})", k.color, k.tolerance),
+                None => format!("クリップ {clip} のクロマキーを外す"),
+            };
+            t.clips[ci].key = key;
             done(vec![RemoveClip { clip }, RestoreClip { track: tid, clip: old }], cmd.clone(), None, s)
         }
         SetPin { clip, keys } => {
